@@ -12,9 +12,9 @@
       "value_map": ""
   },
   {
-    "version": "v1.10.8",
-    "old_name": "genesis",
-    "new_name": "genesis-file",
-    "value_map": ""
+      "version": "v1.10.2",
+      "old_name": "genesis",
+      "new_name": "genesis-file",
+      "value_map": ""
   }
 ]

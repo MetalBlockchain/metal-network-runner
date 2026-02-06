@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,12 +22,14 @@ import (
 
 	"go.uber.org/multierr"
 
+	"github.com/MetalBlockchain/metal-network-runner/local"
 	"github.com/MetalBlockchain/metal-network-runner/network"
 	"github.com/MetalBlockchain/metal-network-runner/network/node"
 	"github.com/MetalBlockchain/metal-network-runner/rpcpb"
 	"github.com/MetalBlockchain/metal-network-runner/utils"
 	"github.com/MetalBlockchain/metal-network-runner/utils/constants"
 	"github.com/MetalBlockchain/metalgo/config"
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/message"
 	"github.com/MetalBlockchain/metalgo/snow/networking/router"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
@@ -47,9 +50,7 @@ const (
 	MinNodes     uint32 = 1
 	DefaultNodes uint32 = 5
 
-	stopTimeout           = 5 * time.Second
-	defaultStartTimeout   = 5 * time.Minute
-	waitForHealthyTimeout = 3 * time.Minute
+	stopTimeout = 30 * time.Second
 
 	networkRootDirPrefix   = "network"
 	TimeParseLayout        = "2006-01-02 15:04:05"
@@ -133,6 +134,10 @@ func New(cfg Config, log logging.Logger) (Server, error) {
 		return nil, err
 	}
 
+	if cfg.SnapshotsDir == "" {
+		cfg.SnapshotsDir = local.DefaultSnapshotsDir
+	}
+
 	s := &server{
 		cfg:        cfg,
 		log:        log,
@@ -176,7 +181,7 @@ func (s *server) Run(rootCtx context.Context) (err error) {
 			ctx, cancel := context.WithTimeout(rootCtx, s.cfg.DialTimeout)
 			gwConn, err := grpc.DialContext(
 				ctx,
-				"0.0.0.0"+s.cfg.Port,
+				"localhost"+s.cfg.Port,
 				grpc.WithBlock(),
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			)
@@ -257,7 +262,7 @@ func (s *server) RPCVersion(context.Context, *rpcpb.RPCVersionRequest) (*rpcpb.R
 	return &rpcpb.RPCVersionResponse{Version: RPCVersion}, nil
 }
 
-func (s *server) Start(_ context.Context, req *rpcpb.StartRequest) (*rpcpb.StartResponse, error) {
+func (s *server) Start(callContext context.Context, req *rpcpb.StartRequest) (*rpcpb.StartResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -275,11 +280,13 @@ func (s *server) Start(_ context.Context, req *rpcpb.StartRequest) (*rpcpb.Start
 		return nil, ErrNotEnoughNodesForStart
 	}
 
-	if err := utils.CheckExecPath(req.GetExecPath()); err != nil {
+	execPath := applyDefaultExecPath(req.GetExecPath())
+	pluginDir := applyDefaultPluginDir(req.GetPluginDir())
+
+	if err := utils.CheckExecPath(execPath); err != nil {
 		return nil, err
 	}
 
-	pluginDir := req.GetPluginDir()
 	chainSpecs := []network.BlockchainSpec{}
 	if len(req.GetBlockchainSpecs()) > 0 {
 		s.log.Info("plugin-dir:", zap.String("plugin-dir", pluginDir))
@@ -293,7 +300,6 @@ func (s *server) Start(_ context.Context, req *rpcpb.StartRequest) (*rpcpb.Start
 	}
 
 	var (
-		execPath          = req.GetExecPath()
 		numNodes          = req.GetNumNodes()
 		trackSubnets      = req.GetWhitelistedSubnets()
 		rootDataDir       = req.GetRootDataDir()
@@ -309,11 +315,11 @@ func (s *server) Start(_ context.Context, req *rpcpb.StartRequest) (*rpcpb.Start
 		if err != nil {
 			return nil, err
 		}
-	}
-	rootDataDir = filepath.Join(rootDataDir, networkRootDirPrefix)
-	rootDataDir, err = utils.MkDirWithTimestamp(rootDataDir)
-	if err != nil {
-		return nil, err
+		rootDataDir = filepath.Join(rootDataDir, networkRootDirPrefix)
+		rootDataDir, err = utils.MkDirWithTimestamp(rootDataDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(customNodeConfigs) > 0 {
@@ -325,10 +331,24 @@ func (s *server) Start(_ context.Context, req *rpcpb.StartRequest) (*rpcpb.Start
 		Pid:         pid,
 		RootDataDir: rootDataDir,
 	}
-
+	beaconConfig := map[ids.NodeID]netip.AddrPort{}
+	for index, id := range req.BootstrapNodeIds {
+		addrPort, err := netip.ParseAddrPort(req.BootstrapIpPortPairs[index])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse IP:port pair %s: %w", req.BootstrapIpPortPairs[index], err)
+		}
+		nodeID, err := ids.NodeIDFromString(id)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse node ID %s: %w", id, err)
+		}
+		beaconConfig[nodeID] = addrPort
+	}
 	s.network, err = newLocalNetwork(localNetworkOptions{
+		networkID:           req.NetworkId,
+		walletPrivateKey:    req.WalletPrivateKey,
 		execPath:            execPath,
 		rootDataDir:         rootDataDir,
+		logRootDir:          req.GetLogRootDir(),
 		numNodes:            numNodes,
 		trackSubnets:        trackSubnets,
 		redirectNodesOutput: s.cfg.RedirectNodesOutput,
@@ -342,6 +362,11 @@ func (s *server) Start(_ context.Context, req *rpcpb.StartRequest) (*rpcpb.Start
 		reassignPortsIfUsed: req.GetReassignPortsIfUsed(),
 		dynamicPorts:        req.GetDynamicPorts(),
 		snapshotsDir:        s.cfg.SnapshotsDir,
+		genesisPath:         req.GenesisPath,
+		beaconConfig:        beaconConfig,
+		upgradePath:         req.UpgradePath,
+		zeroIP:              req.ZeroIp,
+		freshStakingIds:     req.FreshStakingIds,
 	})
 	if err != nil {
 		return nil, err
@@ -358,16 +383,15 @@ func (s *server) Start(_ context.Context, req *rpcpb.StartRequest) (*rpcpb.Start
 		zap.String("global-node-config", globalNodeConfig),
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), waitForHealthyTimeout)
+	ctx, cancel := s.getContext(callContext)
 	defer cancel()
+
 	if err := s.network.Start(ctx); err != nil {
 		s.log.Warn("start failed to complete", zap.Error(err))
 		s.stopAndRemoveNetwork(nil)
 		return nil, err
 	}
 
-	ctx, cancel = context.WithTimeout(context.Background(), waitForHealthyTimeout)
-	defer cancel()
 	chainIDs, err := s.network.CreateChains(ctx, chainSpecs)
 	if err != nil {
 		s.log.Error("network never became healthy", zap.Error(err))
@@ -395,6 +419,9 @@ func (s *server) updateClusterInfo() {
 		// stop may have been called
 		return
 	}
+	s.clusterInfo.RootDataDir = s.network.nw.GetRootDir()
+	s.clusterInfo.LogRootDir = s.network.nw.GetLogRootDir()
+	s.clusterInfo.NetworkId = s.network.networkID
 	s.clusterInfo.Healthy = true
 	s.clusterInfo.NodeNames = maps.Keys(s.network.nodeInfos)
 	sort.Strings(s.clusterInfo.NodeNames)
@@ -411,11 +438,17 @@ func (s *server) updateClusterInfo() {
 // - timeout expires
 // - network operation terminates with error
 // - network operation terminates successfully by setting CustomChainsHealthy
-func (s *server) WaitForHealthy(ctx context.Context, _ *rpcpb.WaitForHealthyRequest) (*rpcpb.WaitForHealthyResponse, error) {
+func (s *server) WaitForHealthy(callContext context.Context, _ *rpcpb.WaitForHealthyRequest) (*rpcpb.WaitForHealthyResponse, error) {
 	s.log.Debug("WaitForHealthy")
 
-	ctx, cancel := context.WithTimeout(ctx, waitForHealthyTimeout)
+	s.mu.RLock()
+	if s.network == nil {
+		s.mu.RUnlock()
+		return nil, ErrNotBootstrapped
+	}
+	ctx, cancel := s.getContext(callContext)
 	defer cancel()
+	s.mu.RUnlock()
 
 	for {
 		s.mu.RLock()
@@ -459,7 +492,7 @@ func (s *server) WaitForHealthy(ctx context.Context, _ *rpcpb.WaitForHealthyRequ
 }
 
 func (s *server) CreateBlockchains(
-	_ context.Context,
+	ctx context.Context,
 	req *rpcpb.CreateBlockchainsRequest,
 ) (*rpcpb.CreateBlockchainsResponse, error) {
 	s.mu.Lock()
@@ -498,8 +531,6 @@ func (s *server) CreateBlockchains(
 	s.clusterInfo.Healthy = false
 	s.clusterInfo.CustomChainsHealthy = false
 
-	ctx, cancel := context.WithTimeout(context.Background(), waitForHealthyTimeout)
-	defer cancel()
 	chainIDs, err := s.network.CreateChains(ctx, chainSpecs)
 	if err != nil {
 		s.log.Error("failed to create blockchains", zap.Error(err))
@@ -522,10 +553,10 @@ func (s *server) CreateBlockchains(
 	return &rpcpb.CreateBlockchainsResponse{ClusterInfo: clusterInfo, ChainIds: strChainIDs}, nil
 }
 
-func (s *server) AddValidator(
-	_ context.Context,
-	req *rpcpb.AddValidatorRequest,
-) (*rpcpb.AddValidatorResponse, error) {
+func (s *server) AddPermissionlessDelegator(
+	callContext context.Context,
+	req *rpcpb.AddPermissionlessDelegatorRequest,
+) (*rpcpb.AddPermissionlessDelegatorResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -533,13 +564,67 @@ func (s *server) AddValidator(
 		return nil, ErrNotBootstrapped
 	}
 
-	s.log.Debug("AddValidator")
+	s.log.Debug("AddPermissionlessDelegator")
 
 	if len(req.GetValidatorSpec()) == 0 {
 		return nil, ErrNoValidatorSpec
 	}
 
-	validatorSpecList := []network.PermissionlessValidatorSpec{}
+	delegatorSpecList := []network.PermissionlessStakerSpec{}
+	for _, spec := range req.GetValidatorSpec() {
+		validatorSpec, err := getPermissionlessValidatorSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		delegatorSpecList = append(delegatorSpecList, validatorSpec)
+	}
+
+	// check that the given subnets exist
+	subnetsSet := set.Set[string]{}
+	subnetsSet.Add(maps.Keys(s.clusterInfo.Subnets)...)
+
+	for _, validatorSpec := range delegatorSpecList {
+		if validatorSpec.SubnetID == "" {
+			return nil, ErrNoSubnetID
+		} else if !subnetsSet.Contains(validatorSpec.SubnetID) {
+			return nil, fmt.Errorf("subnet id %q does not exist", validatorSpec.SubnetID)
+		}
+	}
+
+	ctx, cancel := s.getContext(callContext)
+	defer cancel()
+	err := s.network.AddPermissionlessDelegators(ctx, delegatorSpecList)
+	if err != nil {
+		s.log.Error("failed to add permissionless delegator", zap.Error(err))
+		return nil, err
+	}
+
+	s.log.Info("successfully added permissionless delegator")
+
+	if err != nil {
+		return nil, err
+	}
+	return &rpcpb.AddPermissionlessDelegatorResponse{ClusterInfo: s.clusterInfo}, nil
+}
+
+func (s *server) AddPermissionlessValidator(
+	callContext context.Context,
+	req *rpcpb.AddPermissionlessValidatorRequest,
+) (*rpcpb.AddPermissionlessValidatorResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.network == nil {
+		return nil, ErrNotBootstrapped
+	}
+
+	s.log.Debug("AddPermissionlessValidator")
+
+	if len(req.GetValidatorSpec()) == 0 {
+		return nil, ErrNoValidatorSpec
+	}
+
+	validatorSpecList := []network.PermissionlessStakerSpec{}
 	for _, spec := range req.GetValidatorSpec() {
 		validatorSpec, err := getPermissionlessValidatorSpec(spec)
 		if err != nil {
@@ -563,7 +648,7 @@ func (s *server) AddValidator(
 	s.clusterInfo.Healthy = false
 	s.clusterInfo.CustomChainsHealthy = false
 
-	ctx, cancel := context.WithTimeout(context.Background(), waitForHealthyTimeout)
+	ctx, cancel := s.getContext(callContext)
 	defer cancel()
 	err := s.network.AddPermissionlessValidators(ctx, validatorSpecList)
 
@@ -580,11 +665,11 @@ func (s *server) AddValidator(
 	if err != nil {
 		return nil, err
 	}
-	return &rpcpb.AddValidatorResponse{ClusterInfo: clusterInfo}, nil
+	return &rpcpb.AddPermissionlessValidatorResponse{ClusterInfo: clusterInfo}, nil
 }
 
 func (s *server) AddSubnetValidators(
-	_ context.Context,
+	callContext context.Context,
 	req *rpcpb.AddSubnetValidatorsRequest,
 ) (*rpcpb.AddSubnetValidatorsResponse, error) {
 	s.mu.Lock()
@@ -592,24 +677,28 @@ func (s *server) AddSubnetValidators(
 
 	if s.network == nil {
 		return nil, ErrNotBootstrapped
-	} else if len(req.GetValidatorsSpec()) == 0 {
+	}
+
+	s.log.Debug("AddSubnetValidators")
+
+	if len(req.GetValidatorsSpec()) == 0 {
 		return nil, ErrNoValidatorSpec
 	}
 
-	validators := []network.SubnetValidatorSpec{}
+	validatorSpecList := []network.SubnetValidatorsSpec{}
 	for _, spec := range req.GetValidatorsSpec() {
 		validatorSpec := getSubnetValidatorSpec(spec)
-		validators = append(validators, validatorSpec)
+		validatorSpecList = append(validatorSpecList, validatorSpec)
 	}
 
 	// check that the given subnets exist
-	subnets := set.Set[string]{}
-	subnets.Add(maps.Keys(s.clusterInfo.Subnets)...)
+	subnetsSet := set.Set[string]{}
+	subnetsSet.Add(maps.Keys(s.clusterInfo.Subnets)...)
 
-	for _, validatorSpec := range validators {
+	for _, validatorSpec := range validatorSpecList {
 		if validatorSpec.SubnetID == "" {
 			return nil, ErrNoSubnetID
-		} else if !subnets.Contains(validatorSpec.SubnetID) {
+		} else if !subnetsSet.Contains(validatorSpec.SubnetID) {
 			return nil, fmt.Errorf("subnet id %q does not exist", validatorSpec.SubnetID)
 		}
 	}
@@ -617,26 +706,28 @@ func (s *server) AddSubnetValidators(
 	s.clusterInfo.Healthy = false
 	s.clusterInfo.CustomChainsHealthy = false
 
-	ctx, cancelFunc := context.WithTimeout(context.Background(), waitForHealthyTimeout)
-	defer cancelFunc()
-	if err := s.network.AddSubnetValidators(ctx, validators); err != nil {
+	ctx, cancel := s.getContext(callContext)
+	defer cancel()
+	err := s.network.AddSubnetValidators(ctx, validatorSpecList)
+
+	s.updateClusterInfo()
+
+	if err != nil {
 		s.log.Error("failed to add subnet validators", zap.Error(err))
-		s.updateClusterInfo()
 		return nil, err
-	} else {
-		s.log.Info("successfully added subnet validators")
-		s.updateClusterInfo()
 	}
 
-	if clusterInfo, err := deepCopy(s.clusterInfo); err != nil {
+	s.log.Info("successfully added subnet validators")
+
+	clusterInfo, err := deepCopy(s.clusterInfo)
+	if err != nil {
 		return nil, err
-	} else {
-		return &rpcpb.AddSubnetValidatorsResponse{ClusterInfo: clusterInfo}, nil
 	}
+	return &rpcpb.AddSubnetValidatorsResponse{ClusterInfo: clusterInfo}, nil
 }
 
 func (s *server) RemoveSubnetValidator(
-	_ context.Context,
+	callContext context.Context,
 	req *rpcpb.RemoveSubnetValidatorRequest,
 ) (*rpcpb.RemoveSubnetValidatorResponse, error) {
 	s.mu.Lock()
@@ -646,24 +737,26 @@ func (s *server) RemoveSubnetValidator(
 		return nil, ErrNotBootstrapped
 	}
 
+	s.log.Debug("RemoveSubnetValidator")
+
 	if len(req.GetValidatorSpec()) == 0 {
 		return nil, ErrNoValidatorSpec
 	}
 
-	validators := []network.SubnetValidatorSpec{}
+	validatorSpecList := []network.SubnetValidatorsSpec{}
 	for _, spec := range req.GetValidatorSpec() {
 		validatorSpec := getRemoveSubnetValidatorSpec(spec)
-		validators = append(validators, validatorSpec)
+		validatorSpecList = append(validatorSpecList, validatorSpec)
 	}
 
 	// check that the given subnets exist
-	subnets := set.Set[string]{}
-	subnets.Add(maps.Keys(s.clusterInfo.Subnets)...)
+	subnetsSet := set.Set[string]{}
+	subnetsSet.Add(maps.Keys(s.clusterInfo.Subnets)...)
 
-	for _, validatorSpec := range validators {
+	for _, validatorSpec := range validatorSpecList {
 		if validatorSpec.SubnetID == "" {
 			return nil, ErrNoSubnetID
-		} else if !subnets.Contains(validatorSpec.SubnetID) {
+		} else if !subnetsSet.Contains(validatorSpec.SubnetID) {
 			return nil, fmt.Errorf("subnet id %q does not exist", validatorSpec.SubnetID)
 		}
 	}
@@ -671,9 +764,9 @@ func (s *server) RemoveSubnetValidator(
 	s.clusterInfo.Healthy = false
 	s.clusterInfo.CustomChainsHealthy = false
 
-	ctx, cancel := context.WithTimeout(context.Background(), waitForHealthyTimeout)
+	ctx, cancel := s.getContext(callContext)
 	defer cancel()
-	err := s.network.RemoveSubnetValidator(ctx, validators)
+	err := s.network.RemoveSubnetValidator(ctx, validatorSpecList)
 
 	s.updateClusterInfo()
 
@@ -692,7 +785,7 @@ func (s *server) RemoveSubnetValidator(
 }
 
 func (s *server) TransformElasticSubnets(
-	_ context.Context,
+	callContext context.Context,
 	req *rpcpb.TransformElasticSubnetsRequest,
 ) (*rpcpb.TransformElasticSubnetsResponse, error) {
 	s.mu.Lock()
@@ -729,7 +822,7 @@ func (s *server) TransformElasticSubnets(
 	s.clusterInfo.Healthy = false
 	s.clusterInfo.CustomChainsHealthy = false
 
-	ctx, cancel := context.WithTimeout(context.Background(), waitForHealthyTimeout)
+	ctx, cancel := s.getContext(callContext)
 	defer cancel()
 	txIDs, assetIDs, err := s.network.TransformSubnets(ctx, elasticSubnetSpecList)
 
@@ -759,7 +852,10 @@ func (s *server) TransformElasticSubnets(
 	return &rpcpb.TransformElasticSubnetsResponse{ClusterInfo: clusterInfo, TxIds: strTXIDs, AssetIds: strAssetIDs}, nil
 }
 
-func (s *server) CreateSubnets(_ context.Context, req *rpcpb.CreateSubnetsRequest) (*rpcpb.CreateSubnetsResponse, error) {
+func (s *server) CreateSubnets(
+	callContext context.Context,
+	req *rpcpb.CreateSubnetsRequest,
+) (*rpcpb.CreateSubnetsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -780,7 +876,7 @@ func (s *server) CreateSubnets(_ context.Context, req *rpcpb.CreateSubnetsReques
 	s.clusterInfo.Healthy = false
 	s.clusterInfo.CustomChainsHealthy = false
 
-	ctx, cancel := context.WithTimeout(context.Background(), waitForHealthyTimeout)
+	ctx, cancel := s.getContext(callContext)
 	defer cancel()
 	subnetIDs, err := s.network.CreateSubnets(ctx, subnetSpecs)
 	if err != nil {
@@ -829,6 +925,27 @@ func (s *server) Health(ctx context.Context, _ *rpcpb.HealthRequest) (*rpcpb.Hea
 		return nil, err
 	}
 	return &rpcpb.HealthResponse{ClusterInfo: clusterInfo}, nil
+}
+
+func (s *server) UpdateStatus(ctx context.Context, _ *rpcpb.UpdateStatusRequest) (*rpcpb.UpdateStatusResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.network == nil {
+		return nil, ErrNotBootstrapped
+	}
+
+	if err := s.network.AwaitHealthyAndUpdateNetworkInfo(ctx); err != nil {
+		return nil, err
+	}
+
+	s.updateClusterInfo()
+
+	clusterInfo, err := deepCopy(s.clusterInfo)
+	if err != nil {
+		return nil, err
+	}
+	return &rpcpb.UpdateStatusResponse{ClusterInfo: clusterInfo}, nil
 }
 
 func (s *server) URIs(context.Context, *rpcpb.URIsRequest) (*rpcpb.URIsResponse, error) {
@@ -1003,14 +1120,15 @@ func (s *server) AddNode(_ context.Context, req *rpcpb.AddNodeRequest) (*rpcpb.A
 		}
 	}
 
-	if req.GetPluginDir() != "" {
-		nodeFlags[config.PluginDirKey] = req.GetPluginDir()
+	pluginDir := applyDefaultPluginDir(req.GetPluginDir())
+	if pluginDir != "" {
+		nodeFlags[config.PluginDirKey] = pluginDir
 	}
 
 	nodeConfig := node.Config{
 		Name:               req.Name,
 		Flags:              nodeFlags,
-		BinaryPath:         req.GetExecPath(),
+		BinaryPath:         applyDefaultExecPath(req.GetExecPath()),
 		RedirectStdout:     s.cfg.RedirectNodesOutput,
 		RedirectStderr:     s.cfg.RedirectNodesOutput,
 		ChainConfigFiles:   req.ChainConfigs,
@@ -1079,8 +1197,8 @@ func (s *server) RestartNode(ctx context.Context, req *rpcpb.RestartNodeRequest)
 	if err := s.network.nw.RestartNode(
 		ctx,
 		req.Name,
-		req.GetExecPath(),
-		req.GetPluginDir(),
+		applyDefaultExecPath(req.GetExecPath()),
+		applyDefaultPluginDir(req.GetPluginDir()),
 		req.GetWhitelistedSubnets(),
 		req.GetChainConfigs(),
 		req.GetUpgradeConfigs(),
@@ -1248,7 +1366,10 @@ func (s *server) SendOutboundMessage(ctx context.Context, req *rpcpb.SendOutboun
 	return &rpcpb.SendOutboundMessageResponse{Sent: sent}, err
 }
 
-func (s *server) LoadSnapshot(_ context.Context, req *rpcpb.LoadSnapshotRequest) (*rpcpb.LoadSnapshotResponse, error) {
+func (s *server) LoadSnapshot(
+	callContext context.Context,
+	req *rpcpb.LoadSnapshotRequest,
+) (*rpcpb.LoadSnapshotResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1260,26 +1381,28 @@ func (s *server) LoadSnapshot(_ context.Context, req *rpcpb.LoadSnapshotRequest)
 
 	var err error
 	rootDataDir := req.GetRootDataDir()
-	if len(rootDataDir) == 0 {
+	if len(rootDataDir) == 0 && !req.InPlace {
 		rootDataDir = filepath.Join(os.TempDir(), constants.RootDirPrefix)
 		err = os.MkdirAll(rootDataDir, os.ModePerm)
 		if err != nil {
 			return nil, err
 		}
-	}
-	rootDataDir = filepath.Join(rootDataDir, networkRootDirPrefix)
-	rootDataDir, err = utils.MkDirWithTimestamp(rootDataDir)
-	if err != nil {
-		return nil, err
+		rootDataDir = filepath.Join(rootDataDir, networkRootDirPrefix)
+		rootDataDir, err = utils.MkDirWithTimestamp(rootDataDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	pid := int32(os.Getpid())
-	s.log.Info("starting", zap.Int32("pid", pid), zap.String("root-data-dir", rootDataDir))
+	s.log.Info("starting", zap.Int32("pid", pid), zap.String("root-data-dir", req.GetRootDataDir()))
 
 	s.network, err = newLocalNetwork(localNetworkOptions{
-		execPath:            req.GetExecPath(),
-		pluginDir:           req.GetPluginDir(),
+		execPath:            applyDefaultExecPath(req.GetExecPath()),
+		walletPrivateKey:    req.WalletPrivateKey,
+		pluginDir:           applyDefaultPluginDir(req.GetPluginDir()),
 		rootDataDir:         rootDataDir,
+		logRootDir:          req.GetLogRootDir(),
 		chainConfigs:        req.ChainConfigs,
 		upgradeConfigs:      req.UpgradeConfigs,
 		subnetConfigs:       req.SubnetConfigs,
@@ -1287,23 +1410,27 @@ func (s *server) LoadSnapshot(_ context.Context, req *rpcpb.LoadSnapshotRequest)
 		logLevel:            s.cfg.LogLevel,
 		reassignPortsIfUsed: req.GetReassignPortsIfUsed(),
 		snapshotsDir:        s.cfg.SnapshotsDir,
+		zeroIP:              req.ZeroIp,
 	})
 	if err != nil {
 		return nil, err
 	}
 	s.clusterInfo = &rpcpb.ClusterInfo{
-		Pid:         pid,
-		RootDataDir: rootDataDir,
+		Pid: pid,
 	}
 
 	// blocking load snapshot to soon get not found snapshot errors
-	if err := s.network.LoadSnapshot(req.SnapshotName); err != nil {
+	if err := s.network.LoadSnapshot(
+		req.SnapshotName,
+		req.SnapshotPath,
+		req.InPlace,
+	); err != nil {
 		s.log.Warn("snapshot load failed to complete", zap.Error(err))
 		s.stopAndRemoveNetwork(nil)
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), waitForHealthyTimeout)
+	ctx, cancel := s.getContext(callContext)
 	defer cancel()
 	err = s.network.AwaitHealthyAndUpdateNetworkInfo(ctx)
 	if err != nil {
@@ -1331,7 +1458,12 @@ func (s *server) SaveSnapshot(ctx context.Context, req *rpcpb.SaveSnapshotReques
 		return nil, ErrNotBootstrapped
 	}
 
-	snapshotPath, err := s.network.nw.SaveSnapshot(ctx, req.SnapshotName)
+	snapshotPath, err := s.network.nw.SaveSnapshot(
+		ctx,
+		req.SnapshotName,
+		req.SnapshotPath,
+		req.Force,
+	)
 	if err != nil {
 		s.log.Warn("snapshot save failed to complete", zap.Error(err))
 		return nil, err
@@ -1348,11 +1480,11 @@ func (s *server) RemoveSnapshot(_ context.Context, req *rpcpb.RemoveSnapshotRequ
 
 	s.log.Info("RemoveSnapshot", zap.String("snapshot-name", req.SnapshotName))
 
-	if s.network == nil {
-		return nil, ErrNotBootstrapped
-	}
-
-	if err := s.network.nw.RemoveSnapshot(req.SnapshotName); err != nil {
+	if err := local.RemoveSnapshot(
+		s.cfg.SnapshotsDir,
+		req.SnapshotName,
+		req.SnapshotPath,
+	); err != nil {
 		s.log.Warn("snapshot remove failed to complete", zap.Error(err))
 		return nil, err
 	}
@@ -1365,28 +1497,93 @@ func (s *server) GetSnapshotNames(context.Context, *rpcpb.GetSnapshotNamesReques
 
 	s.log.Info("GetSnapshotNames")
 
-	if s.network == nil {
-		return nil, ErrNotBootstrapped
-	}
-
-	snapshotNames, err := s.network.nw.GetSnapshotNames()
+	snapshotNames, err := local.GetSnapshotNames(s.cfg.SnapshotsDir)
 	if err != nil {
 		return nil, err
 	}
 	return &rpcpb.GetSnapshotNamesResponse{SnapshotNames: snapshotNames}, nil
 }
 
-func (s *server) ListChains(context.Context, *rpcpb.ListChainsRequest) (*rpcpb.ListChainsResponse, error) {
+func (s *server) ListSubnets(context.Context, *rpcpb.ListSubnetsRequest) (*rpcpb.ListSubnetsResponse, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	s.log.Info("ListSubnets")
 
 	if s.network == nil {
 		return nil, ErrNotBootstrapped
 	}
 
-	chains := maps.Values(s.clusterInfo.CustomChains)
+	subnetIDs := maps.Keys(s.clusterInfo.Subnets)
 
-	return &rpcpb.ListChainsResponse{Chains: chains}, nil
+	return &rpcpb.ListSubnetsResponse{SubnetIds: subnetIDs}, nil
+}
+
+func (s *server) ListBlockchains(context.Context, *rpcpb.ListBlockchainsRequest) (*rpcpb.ListBlockchainsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	s.log.Info("ListBlockchains")
+
+	if s.network == nil {
+		return nil, ErrNotBootstrapped
+	}
+
+	blockchains := maps.Values(s.clusterInfo.CustomChains)
+
+	return &rpcpb.ListBlockchainsResponse{Blockchains: blockchains}, nil
+}
+
+func (s *server) ListRpcs(context.Context, *rpcpb.ListRpcsRequest) (*rpcpb.ListRpcsResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	s.log.Info("ListRpcs")
+
+	if s.network == nil {
+		return nil, ErrNotBootstrapped
+	}
+
+	blockchainsRpcs := []*rpcpb.BlockchainRpcs{}
+	for _, chain := range s.clusterInfo.CustomChains {
+		subnetInfo, ok := s.clusterInfo.Subnets[chain.SubnetId]
+		if !ok {
+			return nil, fmt.Errorf("subnet %q not found in subnet info", chain.SubnetId)
+		}
+		nodeNames := subnetInfo.SubnetParticipants.NodeNames
+		sort.Strings(nodeNames)
+		rpcs := []*rpcpb.NodeRpc{}
+		for _, nodeName := range nodeNames {
+			nodeInfo, ok := s.clusterInfo.NodeInfos[nodeName]
+			if !ok {
+				return nil, fmt.Errorf("node %q not found in node info", nodeName)
+			}
+			rpc := fmt.Sprintf("%s/ext/bc/%s/rpc", nodeInfo.Uri, chain.ChainId)
+			nodeRPC := rpcpb.NodeRpc{
+				NodeName: nodeName,
+				Rpc:      rpc,
+			}
+			rpcs = append(rpcs, &nodeRPC)
+		}
+		blockchainRpcs := rpcpb.BlockchainRpcs{
+			BlockchainId: chain.ChainId,
+			Rpcs:         rpcs,
+		}
+		blockchainsRpcs = append(blockchainsRpcs, &blockchainRpcs)
+	}
+
+	return &rpcpb.ListRpcsResponse{BlockchainsRpcs: blockchainsRpcs}, nil
+}
+
+func (s *server) VMID(_ context.Context, req *rpcpb.VMIDRequest) (*rpcpb.VMIDResponse, error) {
+	s.log.Info("VMID")
+
+	vmID, err := utils.VMID(req.VmName)
+	if err != nil {
+		return nil, err
+	}
+
+	return &rpcpb.VMIDResponse{VmId: vmID.String()}, nil
 }
 
 func isClientCanceled(ctxErr error, err error) bool {
@@ -1448,23 +1645,23 @@ func getNetworkElasticSubnetSpec(
 }
 
 func getPermissionlessValidatorSpec(
-	spec *rpcpb.ValidatorSpec,
-) (network.PermissionlessValidatorSpec, error) {
+	spec *rpcpb.PermissionlessStakerSpec,
+) (network.PermissionlessStakerSpec, error) {
 	var startTime time.Time
 	var err error
 	if spec.StartTime != "" {
 		startTime, err = time.Parse(TimeParseLayout, spec.StartTime)
 		if err != nil {
-			return network.PermissionlessValidatorSpec{}, err
+			return network.PermissionlessStakerSpec{}, err
 		}
 		if startTime.Before(time.Now().Add(StakingMinimumLeadTime)) {
-			return network.PermissionlessValidatorSpec{}, fmt.Errorf("time should be at least %s in the future for validator spec of %s", StakingMinimumLeadTime, spec.NodeName)
+			return network.PermissionlessStakerSpec{}, fmt.Errorf("time should be at least %s in the future for validator spec of %s", StakingMinimumLeadTime, spec.NodeName)
 		}
 	}
 
 	stakeDuration := time.Duration(spec.StakeDuration) * time.Hour
 
-	validatorSpec := network.PermissionlessValidatorSpec{
+	validatorSpec := network.PermissionlessStakerSpec{
 		SubnetID:      spec.SubnetId,
 		AssetID:       spec.AssetId,
 		NodeName:      spec.NodeName,
@@ -1477,8 +1674,8 @@ func getPermissionlessValidatorSpec(
 
 func getSubnetValidatorSpec(
 	spec *rpcpb.SubnetValidatorsSpec,
-) network.SubnetValidatorSpec {
-	return network.SubnetValidatorSpec{
+) network.SubnetValidatorsSpec {
+	return network.SubnetValidatorsSpec{
 		SubnetID:  spec.SubnetId,
 		NodeNames: spec.GetNodeNames(),
 	}
@@ -1486,12 +1683,11 @@ func getSubnetValidatorSpec(
 
 func getRemoveSubnetValidatorSpec(
 	spec *rpcpb.RemoveSubnetValidatorSpec,
-) network.SubnetValidatorSpec {
-	validatorSpec := network.SubnetValidatorSpec{
+) network.SubnetValidatorsSpec {
+	return network.SubnetValidatorsSpec{
 		SubnetID:  spec.SubnetId,
 		NodeNames: spec.GetNodeNames(),
 	}
-	return validatorSpec
 }
 
 func getNetworkBlockchainSpec(
@@ -1598,4 +1794,44 @@ func readFileOrString(conf string) []byte {
 		return []byte(conf)
 	}
 	return confBytes
+}
+
+// if [userGivenExecPath] is non empty, returns it
+// otherwise if env var utils.DefaultExecPathEnvVar is
+// defined, returns its contents
+func applyDefaultExecPath(userGivenExecPath string) string {
+	if userGivenExecPath != "" {
+		return userGivenExecPath
+	}
+	return os.Getenv(constants.DefaultExecPathEnvVar)
+}
+
+// if [userGivenPluginDir] is non empty, returns it
+// otherwise if env var utils.DefaultPluginDirEnvVar is
+// defined, returns its contents
+func applyDefaultPluginDir(userGivenPluginDir string) string {
+	if userGivenPluginDir != "" {
+		return userGivenPluginDir
+	}
+	return os.Getenv(constants.DefaultPluginDirEnvVar)
+}
+
+// Assumes [s.mu] is held.
+func (s *server) getContext(callContext context.Context) (context.Context, context.CancelFunc) {
+	timeout := 3 * time.Minute
+	if s.network != nil {
+		timeout = s.network.GetWaitForHealthyTimeout()
+	}
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	_, ok := callContext.Deadline()
+	if ok {
+		ctx = callContext
+		cancel = func() {}
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
+	return ctx, cancel
 }

@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/MetalBlockchain/metal-network-runner/api"
 	"github.com/MetalBlockchain/metal-network-runner/network"
@@ -16,7 +16,6 @@ import (
 	"github.com/MetalBlockchain/metal-network-runner/utils"
 	"github.com/MetalBlockchain/metalgo/config"
 	"github.com/MetalBlockchain/metalgo/ids"
-	"github.com/MetalBlockchain/metalgo/utils/constants"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
 	dircopy "github.com/otiai10/copy"
 	"golang.org/x/exp/maps"
@@ -31,6 +30,8 @@ const (
 type NetworkState struct {
 	// Map from subnet id to elastic subnet tx id
 	SubnetID2ElasticSubnetID map[string]string `json:"subnetID2ElasticSubnetID"`
+	// Map from blockchain id to blockchain aliases
+	BlockchainAliases map[string][]string `json:"blockchainAliases"`
 }
 
 // snapshots generated using older ANR versions may contain deprecated avago flags
@@ -61,9 +62,11 @@ func fixDeprecatedAvagoFlags(flags map[string]interface{}) error {
 // NewNetwork returns a new network from the given snapshot
 func NewNetworkFromSnapshot(
 	log logging.Logger,
-	snapshotName string,
-	rootDir string,
 	snapshotsDir string,
+	snapshotName string,
+	snapshotPath string,
+	rootDir string,
+	logRootDir string,
 	binaryPath string,
 	pluginDir string,
 	chainConfigs map[string]string,
@@ -71,7 +74,23 @@ func NewNetworkFromSnapshot(
 	subnetConfigs map[string]string,
 	flags map[string]interface{},
 	reassignPortsIfUsed bool,
+	redirectStdout bool,
+	redirectStderr bool,
+	inPlace bool,
+	walletPrivateKey string,
+	beaconConfig map[ids.NodeID]netip.AddrPort,
+	zeroIP bool,
 ) (network.Network, error) {
+	if inPlace {
+		if rootDir != "" {
+			return nil, fmt.Errorf("root dir must be empty when using in place snapshot load")
+		}
+		rootDir = getSnapshotDir(snapshotsDir, snapshotName, snapshotPath)
+	}
+	beaconSet, err := utils.BeaconMapToSet(beaconConfig)
+	if err != nil {
+		return nil, err
+	}
 	net, err := newNetwork(
 		log,
 		api.NewAPIClient,
@@ -82,8 +101,14 @@ func NewNetworkFromSnapshot(
 			stderr:      os.Stderr,
 		},
 		rootDir,
+		logRootDir,
 		snapshotsDir,
 		reassignPortsIfUsed,
+		redirectStdout,
+		redirectStderr,
+		walletPrivateKey,
+		beaconSet,
+		zeroIP,
 	)
 	if err != nil {
 		return net, err
@@ -91,19 +116,99 @@ func NewNetworkFromSnapshot(
 	err = net.loadSnapshot(
 		context.Background(),
 		snapshotName,
+		snapshotPath,
 		binaryPath,
 		pluginDir,
 		chainConfigs,
 		upgradeConfigs,
 		subnetConfigs,
 		flags,
+		inPlace,
 	)
 	return net, err
 }
 
+// Save network conf + state into json at root dir
+func (ln *localNetwork) persistNetwork() error {
+	// clone network flags
+	networkConfigFlags := maps.Clone(ln.flags)
+	// remove data dir, log dir references
+	delete(networkConfigFlags, config.DataDirKey)
+	delete(networkConfigFlags, config.LogsDirKey)
+	// clone node info
+	nodeConfigs := []node.Config{}
+	for nodeName, node := range ln.nodes {
+		nodeConfig := node.config
+		// depending on how the user generated the config, different nodes config flags
+		// may point to the same map, so we made a copy to avoid always modifying the same value
+		nodeConfig.Flags = maps.Clone(nodeConfig.Flags)
+		// preserve the current node ports
+		nodeConfig.Flags[config.HTTPPortKey] = ln.nodes[nodeName].GetAPIPort()
+		nodeConfig.Flags[config.StakingPortKey] = ln.nodes[nodeName].GetP2PPort()
+		// remove data dir, log dir references
+		if nodeConfig.ConfigFile != "" {
+			var err error
+			nodeConfig.ConfigFile, err = utils.SetJSONKey(nodeConfig.ConfigFile, config.LogsDirKey, "")
+			if err != nil {
+				return err
+			}
+			nodeConfig.ConfigFile, err = utils.SetJSONKey(nodeConfig.ConfigFile, config.DataDirKey, "")
+			if err != nil {
+				return err
+			}
+		}
+		delete(nodeConfig.Flags, config.LogsDirKey)
+		delete(nodeConfig.Flags, config.DataDirKey)
+		nodeConfigs = append(nodeConfigs, nodeConfig)
+	}
+	// save network conf
+	beaconConf, err := utils.BeaconMapFromSet(ln.bootstraps)
+	if err != nil {
+		return err
+	}
+	networkConfig := network.Config{
+		NetworkID:          ln.networkID,
+		Genesis:            string(ln.genesisData),
+		Upgrade:            string(ln.upgradeData),
+		Flags:              networkConfigFlags,
+		NodeConfigs:        nodeConfigs,
+		BinaryPath:         ln.binaryPath,
+		ChainConfigFiles:   ln.chainConfigFiles,
+		UpgradeConfigFiles: ln.upgradeConfigFiles,
+		SubnetConfigFiles:  ln.subnetConfigFiles,
+		BeaconConfig:       beaconConf,
+	}
+	networkConfigJSON, err := json.MarshalIndent(networkConfig, "", "    ")
+	if err != nil {
+		return err
+	}
+	if err := createFileAndWrite(filepath.Join(ln.rootDir, "network.json"), networkConfigJSON); err != nil {
+		return err
+	}
+	// save dynamic part of network not available on blockchain
+	subnetID2ElasticSubnetID := map[string]string{}
+	for subnetID, elasticSubnetID := range ln.subnetID2ElasticSubnetID {
+		subnetID2ElasticSubnetID[subnetID.String()] = elasticSubnetID.String()
+	}
+	networkState := NetworkState{
+		SubnetID2ElasticSubnetID: subnetID2ElasticSubnetID,
+		BlockchainAliases:        ln.blockchainAliases,
+	}
+	networkStateJSON, err := json.MarshalIndent(networkState, "", "    ")
+	if err != nil {
+		return err
+	}
+	return createFileAndWrite(filepath.Join(ln.rootDir, "state.json"), networkStateJSON)
+}
+
 // Save network snapshot
 // Network is stopped in order to do a safe preservation
-func (ln *localNetwork) SaveSnapshot(ctx context.Context, snapshotName string) (string, error) {
+func (ln *localNetwork) SaveSnapshot(
+	ctx context.Context,
+	snapshotName string,
+	snapshotPath string,
+	force bool,
+) (string, error) {
 	ln.lock.Lock()
 	defer ln.lock.Unlock()
 
@@ -114,100 +219,34 @@ func (ln *localNetwork) SaveSnapshot(ctx context.Context, snapshotName string) (
 		return "", fmt.Errorf("invalid snapshotName %q", snapshotName)
 	}
 	// check if snapshot already exists
-	snapshotDir := filepath.Join(ln.snapshotsDir, snapshotPrefix+snapshotName)
+	snapshotDir := getSnapshotDir(ln.snapshotsDir, snapshotName, snapshotPath)
+	exists := false
 	if _, err := os.Stat(snapshotDir); err == nil {
+		exists = true
+	}
+	// check is network was loaded in place from the given snapshot
+	if ln.rootDir == snapshotDir {
+		return "", fmt.Errorf("already auto saving into the specified snapshot %q", snapshotName)
+	}
+	if !force && exists {
 		return "", fmt.Errorf("snapshot %q already exists", snapshotName)
 	}
-	// keep copy of node info that will be removed by stop
-	nodesConfig := map[string]node.Config{}
-	nodesDBDir := map[string]string{}
-	for nodeName, node := range ln.nodes {
-		nodeConfig := node.config
-		// depending on how the user generated the config, different nodes config flags
-		// may point to the same map, so we made a copy to avoid always modifying the same value
-		nodeConfig.Flags = maps.Clone(nodeConfig.Flags)
-		nodesConfig[nodeName] = nodeConfig
-		nodesDBDir[nodeName] = node.GetDbDir()
+	if err := ln.persistNetwork(); err != nil {
+		return "", err
 	}
-	// we change nodeConfig.Flags so as to preserve in snapshot the current node ports
-	for nodeName, nodeConfig := range nodesConfig {
-		nodeConfig.Flags[config.HTTPPortKey] = ln.nodes[nodeName].GetAPIPort()
-		nodeConfig.Flags[config.StakingPortKey] = ln.nodes[nodeName].GetP2PPort()
-	}
-	// make copy of network flags
-	networkConfigFlags := maps.Clone(ln.flags)
-	// remove all data dir, log dir references
-	delete(networkConfigFlags, config.DataDirKey)
-	delete(networkConfigFlags, config.LogsDirKey)
-	for nodeName, nodeConfig := range nodesConfig {
-		if nodeConfig.ConfigFile != "" {
-			var err error
-			nodeConfig.ConfigFile, err = utils.SetJSONKey(nodeConfig.ConfigFile, config.LogsDirKey, "")
-			if err != nil {
-				return "", err
-			}
-		}
-		delete(nodeConfig.Flags, config.DataDirKey)
-		delete(nodeConfig.Flags, config.LogsDirKey)
-		nodesConfig[nodeName] = nodeConfig
-	}
-
 	// stop network to safely save snapshot
 	if err := ln.stop(ctx); err != nil {
 		return "", err
 	}
-	syscall.Sync()
-	// create main snapshot dirs
-	snapshotDBDir := filepath.Join(snapshotDir, defaultDBSubdir)
-	if err := os.MkdirAll(snapshotDBDir, os.ModePerm); err != nil {
-		return "", err
-	}
-	// save db
-	for _, nodeConfig := range nodesConfig {
-		sourceDBDir, ok := nodesDBDir[nodeConfig.Name]
-		if !ok {
-			return "", fmt.Errorf("failure obtaining db path for node %q", nodeConfig.Name)
-		}
-		sourceDBDir = filepath.Join(sourceDBDir, constants.NetworkName(ln.networkID))
-		targetDBDir := filepath.Join(filepath.Join(snapshotDBDir, nodeConfig.Name), constants.NetworkName(ln.networkID))
-		if err := dircopy.Copy(sourceDBDir, targetDBDir); err != nil {
-			return "", fmt.Errorf("failure saving node %q db dir: %w", nodeConfig.Name, err)
+	// remove if force save
+	if force && exists {
+		if err := ln.RemoveSnapshot(snapshotName, snapshotPath); err != nil {
+			return "", err
 		}
 	}
-	// save network conf
-	networkConfig := network.Config{
-		Genesis:            string(ln.genesis),
-		Flags:              networkConfigFlags,
-		NodeConfigs:        []node.Config{},
-		BinaryPath:         ln.binaryPath,
-		ChainConfigFiles:   ln.chainConfigFiles,
-		UpgradeConfigFiles: ln.upgradeConfigFiles,
-		SubnetConfigFiles:  ln.subnetConfigFiles,
-	}
-
-	// no need to save this, will be generated automatically on snapshot load
-	networkConfig.NodeConfigs = append(networkConfig.NodeConfigs, maps.Values(nodesConfig)...)
-	networkConfigJSON, err := json.MarshalIndent(networkConfig, "", "    ")
-	if err != nil {
-		return "", err
-	}
-	if err := createFileAndWrite(filepath.Join(snapshotDir, "network.json"), networkConfigJSON); err != nil {
-		return "", err
-	}
-	// save dynamic part of network not available on blockchain
-	subnetID2ElasticSubnetID := map[string]string{}
-	for subnetID, elasticSubnetID := range ln.subnetID2ElasticSubnetID {
-		subnetID2ElasticSubnetID[subnetID.String()] = elasticSubnetID.String()
-	}
-	networkState := NetworkState{
-		SubnetID2ElasticSubnetID: subnetID2ElasticSubnetID,
-	}
-	networkStateJSON, err := json.MarshalIndent(networkState, "", "    ")
-	if err != nil {
-		return "", err
-	}
-	if err := createFileAndWrite(filepath.Join(snapshotDir, "state.json"), networkStateJSON); err != nil {
-		return "", err
+	// copy all info
+	if err := dircopy.Copy(ln.rootDir, snapshotDir); err != nil {
+		return "", fmt.Errorf("failure saving data dir %s: %w", ln.rootDir, err)
 	}
 	return snapshotDir, nil
 }
@@ -216,22 +255,23 @@ func (ln *localNetwork) SaveSnapshot(ctx context.Context, snapshotName string) (
 func (ln *localNetwork) loadSnapshot(
 	ctx context.Context,
 	snapshotName string,
+	snapshotPath string,
 	binaryPath string,
 	pluginDir string,
 	chainConfigs map[string]string,
 	upgradeConfigs map[string]string,
 	subnetConfigs map[string]string,
 	flags map[string]interface{},
+	inPlace bool,
 ) error {
 	ln.lock.Lock()
 	defer ln.lock.Unlock()
 
-	snapshotDir := filepath.Join(ln.snapshotsDir, snapshotPrefix+snapshotName)
-	snapshotDBDir := filepath.Join(snapshotDir, defaultDBSubdir)
+	snapshotDir := getSnapshotDir(ln.snapshotsDir, snapshotName, snapshotPath)
 	_, err := os.Stat(snapshotDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("failed accessing snapshot: %s", snapshotDir)
+			return ErrSnapshotNotFound
 		} else {
 			return fmt.Errorf("failure accessing snapshot %q: %w", snapshotName, err)
 		}
@@ -260,14 +300,41 @@ func (ln *localNetwork) loadSnapshot(
 			networkConfig.NodeConfigs[i].Flags[k] = v
 		}
 	}
-	// load db
-	for _, nodeConfig := range networkConfig.NodeConfigs {
-		sourceDBDir := filepath.Join(snapshotDBDir, nodeConfig.Name)
-		targetDBDir := filepath.Join(filepath.Join(ln.rootDir, nodeConfig.Name), defaultDBSubdir)
-		if err := dircopy.Copy(sourceDBDir, targetDBDir); err != nil {
-			return fmt.Errorf("failure loading node %q db dir: %w", nodeConfig.Name, err)
+	// auto migrate v0 to v1
+	v0SnapshotDBDir := filepath.Join(snapshotDir, defaultDBSubdir)
+	if isV0, err := utils.PathExists(v0SnapshotDBDir); err != nil {
+		return err
+	} else if isV0 {
+		for _, nodeConfig := range networkConfig.NodeConfigs {
+			sourceDBDir := filepath.Join(v0SnapshotDBDir, nodeConfig.Name)
+			targetDataDir := filepath.Join(snapshotDir, nodeConfig.Name)
+			if err := os.MkdirAll(targetDataDir, os.ModePerm); err != nil {
+				return err
+			}
+			targetDBDir := filepath.Join(targetDataDir, defaultDBSubdir)
+			if err := os.Rename(sourceDBDir, targetDBDir); err != nil {
+				return err
+			}
 		}
-		nodeConfig.Flags[config.DBPathKey] = targetDBDir
+		if err := os.RemoveAll(v0SnapshotDBDir); err != nil {
+			return err
+		}
+	}
+	// load snapshot dir
+	if !inPlace {
+		if snapshotDir == ln.rootDir {
+			return fmt.Errorf("root dir should differ from snapshot dir for not in place load")
+		}
+		if err := dircopy.Copy(snapshotDir, ln.rootDir); err != nil {
+			return fmt.Errorf("failure loading snapshot root dir: %w", err)
+		}
+	} else if snapshotDir != ln.rootDir {
+		return fmt.Errorf("root dir should equal snapshot dir for not in place load")
+	}
+	// configure each node data dir
+	for _, nodeConfig := range networkConfig.NodeConfigs {
+		delete(nodeConfig.Flags, config.DBPathKey)
+		nodeConfig.Flags[config.DataDirKey] = filepath.Join(ln.rootDir, nodeConfig.Name)
 	}
 	// replace binary path
 	if binaryPath != "" {
@@ -326,17 +393,81 @@ func (ln *localNetwork) loadSnapshot(
 			}
 			ln.subnetID2ElasticSubnetID[subnetID] = elasticSubnetID
 		}
+		for k, v := range networkState.BlockchainAliases {
+			ln.blockchainAliases[k] = v
+		}
 	}
-	return ln.loadConfig(ctx, networkConfig)
+	if err := ln.loadConfig(ctx, networkConfig); err != nil {
+		return err
+	}
+	if err := ln.healthy(ctx); err != nil {
+		return err
+	}
+	// add aliases included in the snapshot state
+	for blockchainID, blockchainAliases := range ln.blockchainAliases {
+		for _, blockchainAlias := range blockchainAliases {
+			if err := ln.setBlockchainAlias(ctx, blockchainID, blockchainAlias); err != nil {
+				return err
+			}
+		}
+	}
+	// add aliases for blockchain names
+	if !utils.IsPublicNetwork(ln.networkID) {
+		node := ln.getNode()
+		blockchains, err := node.GetAPIClient().PChainAPI().GetBlockchains(ctx)
+		if err != nil {
+			return err
+		}
+		for _, blockchain := range blockchains {
+			if blockchain.Name == "C-Chain" || blockchain.Name == "X-Chain" {
+				continue
+			}
+			if err := ln.setBlockchainAlias(ctx, blockchain.ID.String(), blockchain.Name); err != nil {
+				// non fatal error: not required by user
+				ln.log.Warn(err.Error())
+			}
+		}
+	}
+	return ln.persistNetwork()
 }
 
 // Remove network snapshot
-func (ln *localNetwork) RemoveSnapshot(snapshotName string) error {
-	snapshotDir := filepath.Join(ln.snapshotsDir, snapshotPrefix+snapshotName)
+func (ln *localNetwork) RemoveSnapshot(
+	snapshotName string,
+	snapshotPath string,
+) error {
+	return RemoveSnapshot(ln.snapshotsDir, snapshotName, snapshotPath)
+}
+
+// Get network snapshots
+func (ln *localNetwork) GetSnapshotNames() ([]string, error) {
+	return GetSnapshotNames(ln.snapshotsDir)
+}
+
+func getSnapshotDir(
+	snapshotsDir string,
+	snapshotName string,
+	snapshotPath string,
+) string {
+	if snapshotPath != "" {
+		return snapshotPath
+	}
+	if snapshotsDir == "" {
+		snapshotsDir = DefaultSnapshotsDir
+	}
+	return filepath.Join(snapshotsDir, snapshotPrefix+snapshotName)
+}
+
+func RemoveSnapshot(
+	snapshotsDir string,
+	snapshotName string,
+	snapshotPath string,
+) error {
+	snapshotDir := getSnapshotDir(snapshotsDir, snapshotName, snapshotPath)
 	_, err := os.Stat(snapshotDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("failure accessing snapshot: %s", snapshotDir)
+			return ErrSnapshotNotFound
 		} else {
 			return fmt.Errorf("failure accessing snapshot %q: %w", snapshotName, err)
 		}
@@ -347,17 +478,16 @@ func (ln *localNetwork) RemoveSnapshot(snapshotName string) error {
 	return nil
 }
 
-// Get network snapshots
-func (ln *localNetwork) GetSnapshotNames() ([]string, error) {
-	_, err := os.Stat(ln.snapshotsDir)
+func GetSnapshotNames(snapshotsDir string) ([]string, error) {
+	_, err := os.Stat(snapshotsDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("snapshots dir %q does not exists", ln.snapshotsDir)
+			return nil, fmt.Errorf("snapshots dir %q does not exists", snapshotsDir)
 		} else {
-			return nil, fmt.Errorf("failure accessing snapshots dir %q: %w", ln.snapshotsDir, err)
+			return nil, fmt.Errorf("failure accessing snapshots dir %q: %w", snapshotsDir, err)
 		}
 	}
-	matches, err := filepath.Glob(filepath.Join(ln.snapshotsDir, snapshotPrefix+"*"))
+	matches, err := filepath.Glob(filepath.Join(snapshotsDir, snapshotPrefix+"*"))
 	if err != nil {
 		return nil, err
 	}

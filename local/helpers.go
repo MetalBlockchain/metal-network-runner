@@ -1,10 +1,9 @@
 package local
 
 import (
-	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -13,60 +12,56 @@ import (
 
 	"github.com/MetalBlockchain/metal-network-runner/network/node"
 	"github.com/MetalBlockchain/metalgo/config"
-	"github.com/MetalBlockchain/metalgo/utils/constants"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
-	"go.uber.org/zap"
+)
+
+const (
+	stakingPath = "staking"
+	configsPath = "configs"
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-const (
-	MaxPort          = math.MaxUint16
-	minPort          = 10000
-	netListenTimeout = 3 * time.Second
-)
-
-// isFreePort verifies a given [port] is free
-func isFreePort(port uint16) error {
-	// Verify it's free by binding to it
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+func getFreePort() (uint16, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		// Could not bind to [port]. Assumed to be not free.
-		return err
+		return 0, err
 	}
-	// We could bind to [port] so must be free.
+	port := uint16(l.Addr().(*net.TCPAddr).Port)
 	_ = l.Close()
-	return nil
+	return port, nil
 }
 
-// getFreePort generates a random port number and then
-// verifies it is free. If it is, returns that port, otherwise retries.
-// Returns an error if no free port is found within [netListenTimeout].
-// Note that it is possible for [getFreePort] to return the same port twice.
-func getFreePort() (uint16, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), netListenTimeout)
-	defer cancel()
-	for {
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		default:
-			// Generate random port in [minPort, maxPort]
-			port := uint16(rand.Intn(MaxPort-minPort+1) + minPort) //nolint
-			if isFreePort(port) != nil {
-				// Not free. Try another.
-				continue
-			}
-			return port, nil
-		}
-	}
+func getStakingTLSKeyPath(nodeRootDir string) string {
+	return filepath.Join(nodeRootDir, stakingPath, stakingTLSKeyFileName)
+}
+
+func getStakingCertPath(nodeRootDir string) string {
+	return filepath.Join(nodeRootDir, stakingPath, stakingCertFileName)
+}
+
+func getStakingSignerKeyPath(nodeRootDir string) string {
+	return filepath.Join(nodeRootDir, stakingPath, stakingSignerKeyFileName)
+}
+
+func getChainConfigDir(rootDir string) string {
+	return filepath.Join(rootDir, "configs", "chains")
+}
+
+func getSubnetConfigDir(rootDir string) string {
+	return filepath.Join(rootDir, "configs", "subnets")
 }
 
 // writeFiles writes the files a node needs on startup.
 // It returns flags used to point to those files.
-func writeFiles(networkID uint32, genesis []byte, nodeRootDir string, nodeConfig *node.Config) (map[string]string, error) {
+func writeFiles(
+	genesisData []byte,
+	upgradeData []byte,
+	nodeRootDir string,
+	nodeConfig *node.Config,
+) (map[string]string, error) {
 	type file struct {
 		pathKey   string
 		flagValue string
@@ -79,59 +74,59 @@ func writeFiles(networkID uint32, genesis []byte, nodeRootDir string, nodeConfig
 	}
 	files := []file{
 		{
-			flagValue: filepath.Join(nodeRootDir, stakingKeyFileName),
-			path:      filepath.Join(nodeRootDir, stakingKeyFileName),
+			flagValue: "",
+			path:      getStakingTLSKeyPath(nodeRootDir),
 			pathKey:   config.StakingTLSKeyPathKey,
 			contents:  []byte(nodeConfig.StakingKey),
 		},
 		{
-			flagValue: filepath.Join(nodeRootDir, stakingCertFileName),
-			path:      filepath.Join(nodeRootDir, stakingCertFileName),
+			flagValue: "",
+			path:      getStakingCertPath(nodeRootDir),
 			pathKey:   config.StakingCertPathKey,
 			contents:  []byte(nodeConfig.StakingCert),
 		},
 		{
-			flagValue: filepath.Join(nodeRootDir, stakingSigningKeyFileName),
-			path:      filepath.Join(nodeRootDir, stakingSigningKeyFileName),
+			flagValue: "",
+			path:      getStakingSignerKeyPath(nodeRootDir),
 			pathKey:   config.StakingSignerKeyPathKey,
 			contents:  decodedStakingSigningKey,
 		},
 	}
-	if networkID != constants.LocalID {
+	if len(genesisData) > 0 {
 		files = append(files, file{
-			flagValue: filepath.Join(nodeRootDir, genesisFileName),
-			path:      filepath.Join(nodeRootDir, genesisFileName),
+			flagValue: filepath.Join(nodeRootDir, configsPath, genesisFileName),
+			path:      filepath.Join(nodeRootDir, configsPath, genesisFileName),
 			pathKey:   config.GenesisFileKey,
-			contents:  genesis,
+			contents:  genesisData,
 		})
 	}
-	if len(nodeConfig.ConfigFile) != 0 {
+	if len(upgradeData) > 0 {
 		files = append(files, file{
-			flagValue: filepath.Join(nodeRootDir, configFileName),
-			path:      filepath.Join(nodeRootDir, configFileName),
-			pathKey:   config.ConfigFileKey,
-			contents:  []byte(nodeConfig.ConfigFile),
+			flagValue: filepath.Join(nodeRootDir, configsPath, upgradeFileName),
+			path:      filepath.Join(nodeRootDir, configsPath, upgradeFileName),
+			pathKey:   config.UpgradeFileKey,
+			contents:  upgradeData,
 		})
 	}
 	flags := map[string]string{}
 	for _, f := range files {
-		flags[f.pathKey] = f.flagValue
+		if f.flagValue != "" {
+			flags[f.pathKey] = f.flagValue
+		}
 		if err := createFileAndWrite(f.path, f.contents); err != nil {
 			return nil, fmt.Errorf("couldn't write file at %q: %w", f.path, err)
 		}
 	}
 	// chain configs dir
-	chainConfigDir := filepath.Join(nodeRootDir, chainConfigSubDir)
+	chainConfigDir := getChainConfigDir(nodeRootDir)
 	if err := os.MkdirAll(chainConfigDir, 0o750); err != nil {
 		return nil, err
 	}
-	flags[config.ChainConfigDirKey] = chainConfigDir
 	// subnet configs dir
-	subnetConfigDir := filepath.Join(nodeRootDir, subnetConfigSubDir)
+	subnetConfigDir := getSubnetConfigDir(nodeRootDir)
 	if err := os.MkdirAll(subnetConfigDir, 0o750); err != nil {
 		return nil, err
 	}
-	flags[config.SubnetConfigDirKey] = subnetConfigDir
 	// chain configs
 	for chainAlias, chainConfigFile := range nodeConfig.ChainConfigFiles {
 		chainConfigPath := filepath.Join(chainConfigDir, chainAlias, configFileName)
@@ -154,6 +149,31 @@ func writeFiles(networkID uint32, genesis []byte, nodeRootDir string, nodeConfig
 		}
 	}
 	return flags, nil
+}
+
+func writeConfigFile(nodeRootDir string, nodeConfig *node.Config, flags map[string]string) (string, error) {
+	if len(nodeConfig.ConfigFile) != 0 {
+		newFlags := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(nodeConfig.ConfigFile), &newFlags); err != nil {
+			return "", err
+		}
+		for k, vI := range newFlags {
+			v, ok := vI.(string)
+			if !ok {
+				return "", fmt.Errorf("expected string for key %q, found %T", k, vI)
+			}
+			flags[k] = v
+		}
+	}
+	configFileBytes, err := json.MarshalIndent(flags, "", "    ")
+	if err != nil {
+		return "", err
+	}
+	configFilePath := filepath.Join(nodeRootDir, configsPath, configFileName)
+	if err := createFileAndWrite(configFilePath, configFileBytes); err != nil {
+		return "", err
+	}
+	return configFilePath, nil
 }
 
 // getConfigEntry returns an entry in the config file if it is found, otherwise returns the default value
@@ -185,7 +205,6 @@ func getPort(
 	flags map[string]interface{},
 	configFile map[string]interface{},
 	portKey string,
-	reassignIfUsed bool,
 ) (port uint16, err error) {
 	if portIntf, ok := flags[portKey]; ok {
 		switch gotPort := portIntf.(type) {
@@ -203,27 +222,15 @@ func getPort(
 		}
 		port = uint16(portFromConfigFile)
 	} else {
-		// Use a random free port.
-		// Note: it is possible but unlikely for getFreePort to return the same port multiple times.
 		port, err = getFreePort()
 		if err != nil {
 			return 0, fmt.Errorf("couldn't get free port: %w", err)
 		}
-	}
-	if reassignIfUsed && isFreePort(port) != nil {
-		port, err = getFreePort()
-		if err != nil {
-			return 0, fmt.Errorf("couldn't get free port: %w", err)
-		}
-	}
-	// last check, avoid starting network with used ports
-	if err := isFreePort(port); err != nil {
-		return 0, fmt.Errorf("port %d is not free: %w", port, err)
 	}
 	return port, nil
 }
 
-func makeNodeDir(log logging.Logger, rootDir, nodeName string) (string, error) {
+func setNodeDir(log logging.Logger, rootDir, nodeName string) (string, error) {
 	if rootDir == "" {
 		log.Warn("no network root directory defined; will create this node's runtime directory in working directory")
 	}
@@ -231,18 +238,13 @@ func makeNodeDir(log logging.Logger, rootDir, nodeName string) (string, error) {
 	// staking key, staking certificate and genesis file will be written.
 	// (Other file locations are given in the node's config file.)
 	// TODO should we do this for other directories? Profiles?
-	nodeRootDir := getNodeDir(rootDir, nodeName)
+	nodeRootDir := filepath.Join(rootDir, nodeName)
 	if err := os.Mkdir(nodeRootDir, 0o755); err != nil {
 		if !os.IsExist(err) {
-			return "", fmt.Errorf("error creating temp dir %w", err)
+			return "", fmt.Errorf("error creating node %s dir: %w", nodeRootDir, err)
 		}
-		log.Warn("node root directory already exists", zap.String("root-dir", nodeRootDir))
 	}
 	return nodeRootDir, nil
-}
-
-func getNodeDir(rootDir string, nodeName string) string {
-	return filepath.Join(rootDir, nodeName)
 }
 
 // createFileAndWrite creates a file with the given path and
