@@ -8,7 +8,6 @@ import (
 	"github.com/MetalBlockchain/coreth/plugin/evm/client"
 	"github.com/MetalBlockchain/metal-network-runner/api"
 	"github.com/MetalBlockchain/metalgo/api/admin"
-	"github.com/MetalBlockchain/metalgo/api/health"
 	"github.com/MetalBlockchain/metalgo/api/info"
 	"github.com/MetalBlockchain/metalgo/indexer"
 	"github.com/MetalBlockchain/metalgo/vms/avm"
@@ -228,19 +227,19 @@ func (_c *Client_CChainIndexAPI_Call) RunAndReturn(run func() *indexer.Client) *
 }
 
 // HealthAPI provides a mock function for the type Client
-func (_mock *Client) HealthAPI() *health.Client {
+func (_mock *Client) HealthAPI() api.HealthClient {
 	ret := _mock.Called()
 
 	if len(ret) == 0 {
 		panic("no return value specified for HealthAPI")
 	}
 
-	var r0 *health.Client
-	if returnFunc, ok := ret.Get(0).(func() *health.Client); ok {
+	var r0 api.HealthClient
+	if returnFunc, ok := ret.Get(0).(func() api.HealthClient); ok {
 		r0 = returnFunc()
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(*health.Client)
+			r0 = ret.Get(0).(api.HealthClient)
 		}
 	}
 	return r0
@@ -263,12 +262,12 @@ func (_c *Client_HealthAPI_Call) Run(run func()) *Client_HealthAPI_Call {
 	return _c
 }
 
-func (_c *Client_HealthAPI_Call) Return(client1 *health.Client) *Client_HealthAPI_Call {
-	_c.Call.Return(client1)
+func (_c *Client_HealthAPI_Call) Return(healthClient api.HealthClient) *Client_HealthAPI_Call {
+	_c.Call.Return(healthClient)
 	return _c
 }
 
-func (_c *Client_HealthAPI_Call) RunAndReturn(run func() *health.Client) *Client_HealthAPI_Call {
+func (_c *Client_HealthAPI_Call) RunAndReturn(run func() api.HealthClient) *Client_HealthAPI_Call {
 	_c.Call.Return(run)
 	return _c
 }

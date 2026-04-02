@@ -76,7 +76,7 @@ func (c APIClient) InfoAPI() *info.Client {
 	return c.info
 }
 
-func (c APIClient) HealthAPI() *health.Client {
+func (c APIClient) HealthAPI() HealthClient {
 	return c.health
 }
 
