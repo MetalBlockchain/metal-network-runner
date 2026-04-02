@@ -24,7 +24,7 @@ import (
 	"github.com/MetalBlockchain/metalgo/upgrade"
 	"github.com/MetalBlockchain/metalgo/utils"
 	"github.com/MetalBlockchain/metalgo/utils/constants"
-	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls/signer/localsigner"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
 	"github.com/MetalBlockchain/metalgo/utils/math/meter"
 	"github.com/MetalBlockchain/metalgo/utils/resource"
@@ -113,7 +113,6 @@ func (node *localNode) AttachPeer(ctx context.Context, router router.InboundHand
 		return nil, err
 	}
 	mc, err := message.NewCreator(
-		logging.NoLog{},
 		prometheus.NewRegistry(),
 		constants.DefaultNetworkCompressionType,
 		10*time.Second,
@@ -142,7 +141,7 @@ func (node *localNode) AttachPeer(ctx context.Context, router router.InboundHand
 		1,
 	))
 	tls := tlsCert.PrivateKey.(crypto.Signer)
-	bls0, err := bls.NewSecretKey()
+	bls0, err := localsigner.New()
 	if err != nil {
 		return nil, err
 	}
@@ -177,6 +176,7 @@ func (node *localNode) AttachPeer(ctx context.Context, router router.InboundHand
 			logging.NoLog{},
 			peerMsgQueueBufferSize,
 		),
+		false,
 	)
 	cctx, cancel := context.WithTimeout(ctx, peerStartWaitTimeout)
 	err = p.AwaitReady(cctx)

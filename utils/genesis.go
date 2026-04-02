@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	coreth_params "github.com/MetalBlockchain/coreth/params"
 	"github.com/MetalBlockchain/metalgo/upgrade"
-	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls/signer/localsigner"
 	"github.com/MetalBlockchain/metalgo/utils/formatting"
 	"github.com/MetalBlockchain/metalgo/vms/platformvm/signer"
-	coreth_params "github.com/MetalBlockchain/coreth/params"
 )
 
 const (
@@ -72,11 +72,14 @@ func GenerateGenesis(
 		if err != nil {
 			return nil, fmt.Errorf("couldn't get node ID: %w", err)
 		}
-		blsSk, err := bls.SecretKeyFromBytes(keys.BlsKey)
+		blsSk, err := localsigner.FromBytes(keys.BlsKey)
 		if err != nil {
 			return nil, err
 		}
-		p := signer.NewProofOfPossession(blsSk)
+		p, err := signer.NewProofOfPossession(blsSk)
+		if err != nil {
+			return nil, err
+		}
 		pk, err := formatting.Encode(formatting.HexNC, p.PublicKey[:])
 		if err != nil {
 			return nil, err

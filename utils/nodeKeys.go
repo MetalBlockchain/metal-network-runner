@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/MetalBlockchain/metalgo/staking"
-	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls/signer/localsigner"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -35,14 +35,14 @@ func generateNodeKeys() (*NodeKeys, error) {
 	if err != nil {
 		return nil, fmt.Errorf("couldn't generate staking cert/key: %w", err)
 	}
-	key, err := bls.NewSecretKey()
+	key, err := localsigner.New()
 	if err != nil {
 		return nil, fmt.Errorf("couldn't generate new signing key: %w", err)
 	}
 	return &NodeKeys{
 		StakingKey:  stakingKey,
 		StakingCert: stakingCert,
-		BlsKey:      bls.SecretKeyToBytes(key),
+		BlsKey:      key.ToBytes(),
 	}, nil
 }
 

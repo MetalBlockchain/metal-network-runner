@@ -31,7 +31,7 @@ import (
 	"github.com/MetalBlockchain/metalgo/config"
 	"github.com/MetalBlockchain/metalgo/genesis"
 	"github.com/MetalBlockchain/metalgo/ids"
-	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls/signer/localsigner"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
 	"github.com/MetalBlockchain/metalgo/utils/set"
@@ -915,7 +915,7 @@ func newWallet(
 	var w wallet
 	w.addr = privateKey.PublicKey().Address()
 	w.pCTX = pCTX
-	w.pBackend = pwallet.NewBackend(pCTX, pUTXOs, subnetOwners)
+	w.pBackend = pwallet.NewBackend(pUTXOs, subnetOwners)
 	w.pBuilder = pbuilder.New(kc.Addresses(), pCTX, w.pBackend)
 	w.pSigner = psigner.New(kc, w.pBackend)
 	w.pWallet = pwallet.New(p.NewClient(pClient, w.pBackend), w.pBuilder, w.pSigner)
@@ -939,7 +939,7 @@ func (w *wallet) reload(uri string) {
 // it is set to max accepted duration by avalanchego
 func (ln *localNetwork) addPrimaryValidators(
 	ctx context.Context,
-	platformCli platformvm.Client,
+	platformCli *platformvm.Client,
 	w *wallet,
 ) error {
 	ln.log.Info(logging.Green.Wrap("adding the nodes as primary network validators"))
@@ -968,11 +968,14 @@ func (ln *localNetwork) addPrimaryValidators(
 		if err != nil {
 			return err
 		}
-		blsSk, err := bls.SecretKeyFromBytes(blsKeyBytes)
+		blsSk, err := localsigner.FromBytes(blsKeyBytes)
 		if err != nil {
 			return err
 		}
-		proofOfPossession := signer.NewProofOfPossession(blsSk)
+		proofOfPossession, err := signer.NewProofOfPossession(blsSk)
+		if err != nil {
+			return err
+		}
 		cctx, cancel = createDefaultCtx(ctx)
 		tx, err := w.pWallet.IssueAddPermissionlessValidatorTx(
 			&txs.SubnetValidator{
@@ -1510,7 +1513,7 @@ func createSubnets(
 // it ends at the time the primary network validation ends for the node
 func (ln *localNetwork) issueSubnetValidatorTxs(
 	ctx context.Context,
-	platformCli platformvm.Client,
+	platformCli *platformvm.Client,
 	w *wallet,
 	subnetIDs []ids.ID,
 	subnetSpecs []network.SubnetSpec,
@@ -1580,7 +1583,7 @@ func (ln *localNetwork) issueSubnetValidatorTxs(
 // waits until all nodes start validating the primary network
 func (ln *localNetwork) waitPrimaryValidators(
 	ctx context.Context,
-	platformCli platformvm.Client,
+	platformCli *platformvm.Client,
 ) error {
 	ln.log.Info(logging.Green.Wrap("waiting for the nodes to become primary validators"))
 	for {
@@ -1617,7 +1620,7 @@ func (ln *localNetwork) waitPrimaryValidators(
 // waits until all subnet participants start validating the subnetID, for all given subnets
 func (ln *localNetwork) waitSubnetValidators(
 	ctx context.Context,
-	platformCli platformvm.Client,
+	platformCli *platformvm.Client,
 	subnetIDs []ids.ID,
 	subnetSpecs []network.SubnetSpec,
 ) error {
@@ -1867,7 +1870,7 @@ func createDefaultCtx(ctx context.Context) (context.Context, context.CancelFunc)
 
 func subnetIsPermissionless(
 	ctx context.Context,
-	platformCli platformvm.Client,
+	platformCli *platformvm.Client,
 	subnetID ids.ID,
 ) (bool, error) {
 	if _, _, err := platformCli.GetCurrentSupply(ctx, subnetID); err != nil {

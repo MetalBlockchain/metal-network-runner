@@ -25,12 +25,12 @@ import (
 	"github.com/MetalBlockchain/metal-network-runner/utils"
 	"github.com/MetalBlockchain/metal-network-runner/utils/constants"
 	"github.com/MetalBlockchain/metalgo/config"
+	avagonode "github.com/MetalBlockchain/metalgo/config/node"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/network/peer"
-	avagonode "github.com/MetalBlockchain/metalgo/node"
 	"github.com/MetalBlockchain/metalgo/staking"
 	"github.com/MetalBlockchain/metalgo/utils/beacon"
-	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls/signer/localsigner"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
 	"github.com/MetalBlockchain/metalgo/utils/set"
 	"github.com/MetalBlockchain/metalgo/utils/wrappers"
@@ -680,11 +680,11 @@ func (ln *localNetwork) addNode(nodeConfig node.Config) (node.Node, error) {
 				return nil, err
 			}
 		} else {
-			key, err := bls.NewSecretKey()
+			key, err := localsigner.New()
 			if err != nil {
 				return nil, fmt.Errorf("couldn't generate new signing key: %w", err)
 			}
-			keyBytes = bls.SecretKeyToBytes(key)
+			keyBytes = key.ToBytes()
 		}
 		encodedKey := base64.StdEncoding.EncodeToString(keyBytes)
 		nodeConfig.StakingSigningKey = encodedKey

@@ -19,9 +19,8 @@ import (
 	"github.com/MetalBlockchain/metalgo/staking"
 	"github.com/MetalBlockchain/metalgo/upgrade"
 	"github.com/MetalBlockchain/metalgo/utils/constants"
-	"github.com/MetalBlockchain/metalgo/utils/crypto/bls"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/bls/signer/localsigner"
 	"github.com/MetalBlockchain/metalgo/utils/ips"
-	"github.com/MetalBlockchain/metalgo/utils/logging"
 	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/metalgo/version"
 	"github.com/prometheus/client_golang/prometheus"
@@ -81,7 +80,7 @@ func verifyProtocol(
 		Timestamp: now,
 	}
 	signer := myTLSCert.PrivateKey.(crypto.Signer)
-	bls0, err := bls.NewSecretKey()
+	bls0, err := localsigner.New()
 	if err != nil {
 		errCh <- err
 		return
@@ -223,7 +222,6 @@ func TestAttachPeer(t *testing.T) {
 
 	// For message creation and parsing
 	mc, err := message.NewCreator(
-		logging.NoLog{},
 		prometheus.NewRegistry(),
 		constants.DefaultNetworkCompressionType,
 		10*time.Second,
