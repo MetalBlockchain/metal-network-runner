@@ -1,0 +1,22 @@
+packages:
+  # Adjust the module path to match your go.mod
+  github.com/MetalBlockchain/metal-network-runner/api:
+    interfaces:
+      Client:
+        config:
+          dir: api/mocks
+          filename: client.go
+          structname: Client
+      EthClient:
+        config:
+          dir: api/mocks
+          filename: EthClient.go
+          structname: EthClient
+
+  github.com/MetalBlockchain/metal-network-runner/local:
+    interfaces:
+      NodeProcess:
+        config:
+          dir: local/mocks
+          filename: node_process.go
+          structname: NodeProcess

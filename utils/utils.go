@@ -5,27 +5,43 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	rpcb "github.com/MetalBlockchain/metal-network-runner/rpcpb"
 	"github.com/MetalBlockchain/metal-network-runner/ux"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/staking"
+	"github.com/MetalBlockchain/metalgo/utils/beacon"
+	"github.com/MetalBlockchain/metalgo/utils/constants"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
 )
 
 const (
 	genesisNetworkIDKey = "networkID"
 	dirTimestampFormat  = "20060102_150405"
+	dockerEnvPath       = "/.dockerenv"
+)
+
+var (
+	ErrEmptyExecPath    = errors.New("the path to the avalanchego executable is not defined. please make sure to either set the AVALANCHEGO_EXEC_PATH environment variable or pass the path with the --avalanchego-path flag")
+	ErrNotExists        = errors.New("the avalanchego executable does not exists at the provided path")
+	ErrNotExistsPlugin  = errors.New("the vm plugin does not exists at the provided path. please check if the plugin path is set correctly in the AVALANCHEGO_PLUGIN_PATH environment variable or the --plugin-dir flag and if the plugin binary is located there")
+	ErrorNoNetworkIDKey = fmt.Errorf("couldn't find key %q in genesis", genesisNetworkIDKey)
 )
 
 func ToNodeID(stakingKey, stakingCert []byte) (ids.NodeID, error) {
-	cert, err := staking.LoadTLSCertFromBytes(stakingKey, stakingCert)
+	tlsCert, err := staking.LoadTLSCertFromBytes(stakingKey, stakingCert)
 	if err != nil {
 		return ids.EmptyNodeID, err
 	}
-	nodeID := ids.NodeIDFromCert(cert.Leaf)
+	cert, err := staking.ParseCertificate(tlsCert.Leaf.Raw)
+	if err != nil {
+		return ids.EmptyNodeID, err
+	}
+	nodeID := ids.NodeIDFromCert(cert)
 	return nodeID, nil
 }
 
@@ -46,15 +62,23 @@ func NetworkIDFromGenesis(genesis []byte) (uint32, error) {
 	return uint32(networkID), nil
 }
 
-var (
-	ErrInvalidExecPath = errors.New("metal exec is invalid")
-	ErrNotExists       = errors.New("metal exec not exists")
-	ErrNotExistsPlugin = errors.New("plugin exec not exists")
-)
+func SetGenesisNetworkID(genesis []byte, networkID uint32) ([]byte, error) {
+	genesisMap := map[string]interface{}{}
+	if err := json.Unmarshal(genesis, &genesisMap); err != nil {
+		return nil, fmt.Errorf("couldn't unmarshal genesis: %w", err)
+	}
+	genesisMap[genesisNetworkIDKey] = networkID
+	var err error
+	genesis, err = json.MarshalIndent(genesisMap, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("couldn't marshal genesis: %w", err)
+	}
+	return genesis, nil
+}
 
 func CheckExecPath(exec string) error {
 	if exec == "" {
-		return ErrInvalidExecPath
+		return ErrEmptyExecPath
 	}
 	_, err := os.Stat(exec)
 	if err != nil {
@@ -87,9 +111,13 @@ func VMID(vmName string) (ids.ID, error) {
 	return ids.ToID(b)
 }
 
-func MkDirWithTimestamp(dirPrefix string) (string, error) {
+func DirnameWithTimestamp(dirPrefix string) string {
 	currentTime := time.Now().Format(dirTimestampFormat)
-	dirName := dirPrefix + "_" + currentTime
+	return dirPrefix + "_" + currentTime
+}
+
+func MkDirWithTimestamp(dirPrefix string) (string, error) {
+	dirName := DirnameWithTimestamp(dirPrefix)
 	return dirName, os.MkdirAll(dirName, os.ModePerm)
 }
 
@@ -123,4 +151,96 @@ func VerifySubnetHasCorrectParticipants(
 		ux.Print(log, logging.Red.Wrap("VerifySubnetHasCorrectParticipants: cluster is nil"))
 	}
 	return false
+}
+
+func IsInsideDockerContainer() (bool, error) {
+	return PathExists(dockerEnvPath)
+}
+
+func PathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// FileExists checks if a file exists.
+func FileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func WaitForFile(
+	filename string,
+	timeout time.Duration,
+	checkInterval time.Duration,
+	description string,
+) error {
+	t0 := time.Now()
+	for {
+		if FileExists(filename) {
+			break
+		}
+		elapsed := time.Since(t0)
+		if elapsed > timeout {
+			return fmt.Errorf(
+				"%s within %.0f seconds",
+				description,
+				timeout.Seconds(),
+			)
+		}
+		time.Sleep(checkInterval)
+	}
+	return nil
+}
+
+func IsPublicNetwork(networkID uint32) bool {
+	return networkID == constants.TahoeID || networkID == constants.MainnetID
+}
+
+func IsCustomNetwork(networkID uint32) bool {
+	return !IsPublicNetwork(networkID) && networkID != constants.LocalID
+}
+
+func BeaconMapToSet(beaconMap map[ids.NodeID]netip.AddrPort) (beacon.Set, error) {
+	set := beacon.NewSet()
+	for id, addr := range beaconMap {
+		if err := set.Add(beacon.New(id, addr)); err != nil {
+			return nil, fmt.Errorf("failed to add beacon to set: %w", err)
+		}
+	}
+	return set, nil
+}
+
+func BeaconMapFromSet(beaconSet beacon.Set) (map[ids.NodeID]netip.AddrPort, error) {
+	beaconMap := make(map[ids.NodeID]netip.AddrPort)
+	if beaconSet.Len() == 0 {
+		return beaconMap, nil
+	}
+	beaconIDs := strings.Split(beaconSet.IDsArg(), ",")
+	beaconIPs := strings.Split(beaconSet.IPsArg(), ",")
+
+	if len(beaconIDs) != len(beaconIPs) {
+		return nil, fmt.Errorf("beacon IDs and IPs do not match")
+	}
+
+	for i := 0; i < len(beaconIDs); i++ {
+		beaconID, err := ids.NodeIDFromString(beaconIDs[i])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse beacon ID: %w", err)
+		}
+		beaconIP, err := netip.ParseAddrPort(beaconIPs[i])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse beacon IP: %w", err)
+		}
+		beaconMap[beaconID] = beaconIP
+	}
+	return beaconMap, nil
 }

@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MetalBlockchain/metal-network-runner/local"
 	"github.com/MetalBlockchain/metal-network-runner/rpcpb"
+	"github.com/MetalBlockchain/metal-network-runner/utils/constants"
 	"github.com/MetalBlockchain/metalgo/utils/logging"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -34,9 +34,12 @@ type Client interface {
 	CreateBlockchains(ctx context.Context, blockchainSpecs []*rpcpb.BlockchainSpec) (*rpcpb.CreateBlockchainsResponse, error)
 	CreateSubnets(ctx context.Context, subnetSpecs []*rpcpb.SubnetSpec) (*rpcpb.CreateSubnetsResponse, error)
 	TransformElasticSubnets(ctx context.Context, elasticSubnetSpecs []*rpcpb.ElasticSubnetSpec) (*rpcpb.TransformElasticSubnetsResponse, error)
-	AddPermissionlessValidator(ctx context.Context, validatorSpec []*rpcpb.PermissionlessValidatorSpec) (*rpcpb.AddPermissionlessValidatorResponse, error)
+	AddPermissionlessValidator(ctx context.Context, validatorSpec []*rpcpb.PermissionlessStakerSpec) (*rpcpb.AddPermissionlessValidatorResponse, error)
+	AddPermissionlessDelegator(ctx context.Context, validatorSpec []*rpcpb.PermissionlessStakerSpec) (*rpcpb.AddPermissionlessDelegatorResponse, error)
 	RemoveSubnetValidator(ctx context.Context, validatorSpec []*rpcpb.RemoveSubnetValidatorSpec) (*rpcpb.RemoveSubnetValidatorResponse, error)
+	AddSubnetValidators(ctx context.Context, validatorSpec []*rpcpb.SubnetValidatorsSpec) (*rpcpb.AddSubnetValidatorsResponse, error)
 	Health(ctx context.Context) (*rpcpb.HealthResponse, error)
+	UpdateStatus(ctx context.Context) (*rpcpb.UpdateStatusResponse, error)
 	WaitForHealthy(ctx context.Context) (*rpcpb.WaitForHealthyResponse, error)
 	URIs(ctx context.Context) ([]string, error)
 	Status(ctx context.Context) (*rpcpb.StatusResponse, error)
@@ -50,10 +53,14 @@ type Client interface {
 	AttachPeer(ctx context.Context, nodeName string) (*rpcpb.AttachPeerResponse, error)
 	SendOutboundMessage(ctx context.Context, nodeName string, peerID string, op uint32, msgBody []byte) (*rpcpb.SendOutboundMessageResponse, error)
 	Close() error
-	SaveSnapshot(ctx context.Context, snapshotName string) (*rpcpb.SaveSnapshotResponse, error)
-	LoadSnapshot(ctx context.Context, snapshotName string, opts ...OpOption) (*rpcpb.LoadSnapshotResponse, error)
-	RemoveSnapshot(ctx context.Context, snapshotName string) (*rpcpb.RemoveSnapshotResponse, error)
-	GetSnapshotNames(ctx context.Context) ([]string, error)
+	SaveSnapshot(ctx context.Context, snapshotName string, force bool, opts ...OpOption) (*rpcpb.SaveSnapshotResponse, error)
+	LoadSnapshot(ctx context.Context, snapshotName string, inPlace bool, opts ...OpOption) (*rpcpb.LoadSnapshotResponse, error)
+	RemoveSnapshot(ctx context.Context, snapshotName string, opts ...OpOption) (*rpcpb.RemoveSnapshotResponse, error)
+	ListSnapshots(ctx context.Context) ([]string, error)
+	ListSubnets(ctx context.Context) ([]string, error)
+	ListBlockchains(ctx context.Context) ([]*rpcpb.CustomChainInfo, error)
+	ListRpcs(ctx context.Context) ([]*rpcpb.BlockchainRpcs, error)
+	VMID(ctx context.Context, vmName string) (string, error)
 }
 
 type client struct {
@@ -108,21 +115,27 @@ func (c *client) RPCVersion(ctx context.Context) (*rpcpb.RPCVersionResponse, err
 }
 
 func (c *client) Start(ctx context.Context, execPath string, opts ...OpOption) (*rpcpb.StartResponse, error) {
-	ret := &Op{numNodes: local.DefaultNumNodes}
+	ret := &Op{numNodes: constants.DefaultNumNodes}
 	ret.applyOpts(opts)
 
 	req := &rpcpb.StartRequest{
-		ExecPath:       execPath,
-		NumNodes:       &ret.numNodes,
-		ChainConfigs:   ret.chainConfigs,
-		UpgradeConfigs: ret.upgradeConfigs,
-		SubnetConfigs:  ret.subnetConfigs,
+		NetworkId:       ret.networkID,
+		ExecPath:        execPath,
+		NumNodes:        &ret.numNodes,
+		ChainConfigs:    ret.chainConfigs,
+		UpgradeConfigs:  ret.upgradeConfigs,
+		SubnetConfigs:   ret.subnetConfigs,
+		ZeroIp:          ret.zeroIP,
+		FreshStakingIds: ret.freshStakingIds,
 	}
 	if ret.trackSubnets != "" {
 		req.WhitelistedSubnets = &ret.trackSubnets
 	}
 	if ret.rootDataDir != "" {
 		req.RootDataDir = &ret.rootDataDir
+	}
+	if ret.logRootDir != "" {
+		req.LogRootDir = &ret.logRootDir
 	}
 	if ret.pluginDir != "" {
 		req.PluginDir = ret.pluginDir
@@ -135,6 +148,21 @@ func (c *client) Start(ctx context.Context, execPath string, opts ...OpOption) (
 	}
 	if ret.customNodeConfigs != nil {
 		req.CustomNodeConfigs = ret.customNodeConfigs
+	}
+	if ret.walletPrivateKey != "" {
+		req.WalletPrivateKey = ret.walletPrivateKey
+	}
+	if ret.genesisPath != "" {
+		req.GenesisPath = ret.genesisPath
+	}
+	if len(ret.bootstrapNodeIPPortPairs) > 0 {
+		req.BootstrapIpPortPairs = ret.bootstrapNodeIPPortPairs
+	}
+	if len(ret.bootstrapNodeIDs) > 0 {
+		req.BootstrapNodeIds = ret.bootstrapNodeIDs
+	}
+	if ret.upgradePath != "" {
+		req.UpgradePath = ret.upgradePath
 	}
 	req.ReassignPortsIfUsed = &ret.reassignPortsIfUsed
 	req.DynamicPorts = &ret.dynamicPorts
@@ -170,7 +198,16 @@ func (c *client) TransformElasticSubnets(ctx context.Context, elasticSubnetSpecs
 	return c.controlc.TransformElasticSubnets(ctx, req)
 }
 
-func (c *client) AddPermissionlessValidator(ctx context.Context, validatorSpec []*rpcpb.PermissionlessValidatorSpec) (*rpcpb.AddPermissionlessValidatorResponse, error) {
+func (c *client) AddPermissionlessDelegator(ctx context.Context, validatorSpec []*rpcpb.PermissionlessStakerSpec) (*rpcpb.AddPermissionlessDelegatorResponse, error) {
+	req := &rpcpb.AddPermissionlessDelegatorRequest{
+		ValidatorSpec: validatorSpec,
+	}
+
+	c.log.Info("add permissionless delegators to elastic subnets")
+	return c.controlc.AddPermissionlessDelegator(ctx, req)
+}
+
+func (c *client) AddPermissionlessValidator(ctx context.Context, validatorSpec []*rpcpb.PermissionlessStakerSpec) (*rpcpb.AddPermissionlessValidatorResponse, error) {
 	req := &rpcpb.AddPermissionlessValidatorRequest{
 		ValidatorSpec: validatorSpec,
 	}
@@ -188,9 +225,22 @@ func (c *client) RemoveSubnetValidator(ctx context.Context, validatorSpec []*rpc
 	return c.controlc.RemoveSubnetValidator(ctx, req)
 }
 
+func (c *client) AddSubnetValidators(ctx context.Context, validatorSpec []*rpcpb.SubnetValidatorsSpec) (*rpcpb.AddSubnetValidatorsResponse, error) {
+	req := &rpcpb.AddSubnetValidatorsRequest{
+		ValidatorsSpec: validatorSpec,
+	}
+
+	c.log.Info("add subnet validators")
+	return c.controlc.AddSubnetValidators(ctx, req)
+}
+
 func (c *client) Health(ctx context.Context) (*rpcpb.HealthResponse, error) {
 	c.log.Info("health")
 	return c.controlc.Health(ctx, &rpcpb.HealthRequest{})
+}
+
+func (c *client) UpdateStatus(ctx context.Context) (*rpcpb.UpdateStatusResponse, error) {
+	return c.controlc.UpdateStatus(ctx, &rpcpb.UpdateStatusRequest{})
 }
 
 func (c *client) WaitForHealthy(ctx context.Context) (*rpcpb.WaitForHealthyResponse, error) {
@@ -337,20 +387,40 @@ func (c *client) SendOutboundMessage(ctx context.Context, nodeName string, peerI
 	})
 }
 
-func (c *client) SaveSnapshot(ctx context.Context, snapshotName string) (*rpcpb.SaveSnapshotResponse, error) {
+func (c *client) SaveSnapshot(
+	ctx context.Context,
+	snapshotName string,
+	force bool,
+	opts ...OpOption,
+) (*rpcpb.SaveSnapshotResponse, error) {
 	c.log.Info("save snapshot", zap.String("snapshot-name", snapshotName))
-	return c.controlc.SaveSnapshot(ctx, &rpcpb.SaveSnapshotRequest{SnapshotName: snapshotName})
+	ret := &Op{}
+	ret.applyOpts(opts)
+	req := rpcpb.SaveSnapshotRequest{
+		SnapshotName: snapshotName,
+		SnapshotPath: ret.snapshotPath,
+		Force:        force,
+	}
+	return c.controlc.SaveSnapshot(ctx, &req)
 }
 
-func (c *client) LoadSnapshot(ctx context.Context, snapshotName string, opts ...OpOption) (*rpcpb.LoadSnapshotResponse, error) {
+func (c *client) LoadSnapshot(
+	ctx context.Context,
+	snapshotName string,
+	inPlace bool,
+	opts ...OpOption,
+) (*rpcpb.LoadSnapshotResponse, error) {
 	c.log.Info("load snapshot", zap.String("snapshot-name", snapshotName))
 	ret := &Op{}
 	ret.applyOpts(opts)
 	req := rpcpb.LoadSnapshotRequest{
 		SnapshotName:   snapshotName,
+		SnapshotPath:   ret.snapshotPath,
 		ChainConfigs:   ret.chainConfigs,
 		UpgradeConfigs: ret.upgradeConfigs,
 		SubnetConfigs:  ret.subnetConfigs,
+		InPlace:        inPlace,
+		ZeroIp:         ret.zeroIP,
 	}
 	if ret.execPath != "" {
 		req.ExecPath = &ret.execPath
@@ -361,25 +431,78 @@ func (c *client) LoadSnapshot(ctx context.Context, snapshotName string, opts ...
 	if ret.rootDataDir != "" {
 		req.RootDataDir = &ret.rootDataDir
 	}
+	if ret.logRootDir != "" {
+		req.LogRootDir = &ret.logRootDir
+	}
 	if ret.globalNodeConfig != "" {
 		req.GlobalNodeConfig = &ret.globalNodeConfig
 	}
+	if ret.walletPrivateKey != "" {
+		req.WalletPrivateKey = ret.walletPrivateKey
+	}
+
 	req.ReassignPortsIfUsed = &ret.reassignPortsIfUsed
 	return c.controlc.LoadSnapshot(ctx, &req)
 }
 
-func (c *client) RemoveSnapshot(ctx context.Context, snapshotName string) (*rpcpb.RemoveSnapshotResponse, error) {
+func (c *client) RemoveSnapshot(
+	ctx context.Context,
+	snapshotName string,
+	opts ...OpOption,
+) (*rpcpb.RemoveSnapshotResponse, error) {
 	c.log.Info("remove snapshot", zap.String("snapshot-name", snapshotName))
-	return c.controlc.RemoveSnapshot(ctx, &rpcpb.RemoveSnapshotRequest{SnapshotName: snapshotName})
+	ret := &Op{}
+	ret.applyOpts(opts)
+	req := rpcpb.RemoveSnapshotRequest{
+		SnapshotName: snapshotName,
+		SnapshotPath: ret.snapshotPath,
+	}
+	return c.controlc.RemoveSnapshot(ctx, &req)
 }
 
-func (c *client) GetSnapshotNames(ctx context.Context) ([]string, error) {
-	c.log.Info("get snapshot names")
+func (c *client) ListSnapshots(ctx context.Context) ([]string, error) {
+	c.log.Info("list snapshots")
 	resp, err := c.controlc.GetSnapshotNames(ctx, &rpcpb.GetSnapshotNamesRequest{})
 	if err != nil {
 		return nil, err
 	}
 	return resp.SnapshotNames, nil
+}
+
+func (c *client) ListSubnets(ctx context.Context) ([]string, error) {
+	c.log.Info("list subnets")
+	resp, err := c.controlc.ListSubnets(ctx, &rpcpb.ListSubnetsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.SubnetIds, nil
+}
+
+func (c *client) ListBlockchains(ctx context.Context) ([]*rpcpb.CustomChainInfo, error) {
+	c.log.Info("list blockchains")
+	resp, err := c.controlc.ListBlockchains(ctx, &rpcpb.ListBlockchainsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Blockchains, nil
+}
+
+func (c *client) ListRpcs(ctx context.Context) ([]*rpcpb.BlockchainRpcs, error) {
+	c.log.Info("list rpcs")
+	resp, err := c.controlc.ListRpcs(ctx, &rpcpb.ListRpcsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.BlockchainsRpcs, nil
+}
+
+func (c *client) VMID(ctx context.Context, vmName string) (string, error) {
+	c.log.Info("vmid")
+	resp, err := c.controlc.VMID(ctx, &rpcpb.VMIDRequest{VmName: vmName})
+	if err != nil {
+		return "", err
+	}
+	return resp.VmId, nil
 }
 
 func (c *client) Close() error {
@@ -390,20 +513,30 @@ func (c *client) Close() error {
 }
 
 type Op struct {
-	numNodes            uint32
-	execPath            string
-	trackSubnets        string
-	globalNodeConfig    string
-	rootDataDir         string
-	pluginDir           string
-	blockchainSpecs     []*rpcpb.BlockchainSpec
-	customNodeConfigs   map[string]string
-	numSubnets          uint32
-	chainConfigs        map[string]string
-	upgradeConfigs      map[string]string
-	subnetConfigs       map[string]string
-	reassignPortsIfUsed bool
-	dynamicPorts        bool
+	numNodes                 uint32
+	execPath                 string
+	trackSubnets             string
+	globalNodeConfig         string
+	rootDataDir              string
+	logRootDir               string
+	pluginDir                string
+	blockchainSpecs          []*rpcpb.BlockchainSpec
+	customNodeConfigs        map[string]string
+	numSubnets               uint32
+	chainConfigs             map[string]string
+	upgradeConfigs           map[string]string
+	subnetConfigs            map[string]string
+	reassignPortsIfUsed      bool
+	dynamicPorts             bool
+	networkID                uint32
+	walletPrivateKey         string
+	genesisPath              string
+	bootstrapNodeIDs         []string
+	bootstrapNodeIPPortPairs []string
+	upgradePath              string
+	snapshotPath             string
+	zeroIP                   bool
+	freshStakingIds          bool
 }
 
 type OpOption func(*Op)
@@ -417,6 +550,12 @@ func (op *Op) applyOpts(opts []OpOption) {
 func WithGlobalNodeConfig(nodeConfig string) OpOption {
 	return func(op *Op) {
 		op.globalNodeConfig = nodeConfig
+	}
+}
+
+func WithNetworkID(networkID uint32) OpOption {
+	return func(op *Op) {
+		op.networkID = networkID
 	}
 }
 
@@ -447,6 +586,12 @@ func WithTrackSubnets(trackSubnets string) OpOption {
 func WithRootDataDir(rootDataDir string) OpOption {
 	return func(op *Op) {
 		op.rootDataDir = rootDataDir
+	}
+}
+
+func WithLogRootDir(logRootDir string) OpOption {
+	return func(op *Op) {
+		op.logRootDir = logRootDir
 	}
 }
 
@@ -506,6 +651,54 @@ func WithReassignPortsIfUsed(reassignPortsIfUsed bool) OpOption {
 func WithDynamicPorts(dynamicPorts bool) OpOption {
 	return func(op *Op) {
 		op.dynamicPorts = dynamicPorts
+	}
+}
+
+func WithWalletPrivateKey(walletPrivateKey string) OpOption {
+	return func(op *Op) {
+		op.walletPrivateKey = walletPrivateKey
+	}
+}
+
+func WithGenesisPath(genesisPath string) OpOption {
+	return func(op *Op) {
+		op.genesisPath = genesisPath
+	}
+}
+
+func WithBootstrapNodeIDs(bootstrapNodeIDs []string) OpOption {
+	return func(op *Op) {
+		op.bootstrapNodeIDs = bootstrapNodeIDs
+	}
+}
+
+func WithBootstrapNodeIPPortPairs(bootstrapNodeIPPortPairs []string) OpOption {
+	return func(op *Op) {
+		op.bootstrapNodeIPPortPairs = bootstrapNodeIPPortPairs
+	}
+}
+
+func WithUpgradePath(upgradePath string) OpOption {
+	return func(op *Op) {
+		op.upgradePath = upgradePath
+	}
+}
+
+func WithSnapshotPath(snapshotPath string) OpOption {
+	return func(op *Op) {
+		op.snapshotPath = snapshotPath
+	}
+}
+
+func WithZeroIP(zeroIP bool) OpOption {
+	return func(op *Op) {
+		op.zeroIP = zeroIP
+	}
+}
+
+func WithFreshStakingIds(freshStakingIds bool) OpOption {
+	return func(op *Op) {
+		op.freshStakingIds = freshStakingIds
 	}
 }
 

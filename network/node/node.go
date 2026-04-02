@@ -3,7 +3,6 @@ package node
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/MetalBlockchain/metal-network-runner/api"
@@ -14,21 +13,23 @@ import (
 	"github.com/MetalBlockchain/metalgo/snow/networking/router"
 )
 
-// Node represents an Metal node
+// Node represents an AvalancheGo node
 type Node interface {
 	// Return this node's name, which is unique
 	// across all the nodes in its network.
 	GetName() string
-	// Return this node's Metal node ID.
+	// Return this node's Avalanche node ID.
 	GetNodeID() ids.NodeID
 	// Return a client that can be used to make API calls.
 	GetAPIClient() api.Client
 	// Return this node's IP (e.g. 127.0.0.1).
-	GetURL() string
+	GetIP() string
 	// Return this node's P2P (staking) port.
 	GetP2PPort() uint16
 	// Return this node's HTTP API port.
 	GetAPIPort() uint16
+	// Return this node's URI (e.g. http://127.0.0.1:9650).
+	GetURI() string
 	// Starts a new test peer, connects it to the given node, and returns the peer.
 	// [handler] defines how the test peer handles messages it receives.
 	// The test peer can be used to send messages to the node it's attached to.
@@ -39,7 +40,7 @@ type Node interface {
 	SendOutboundMessage(ctx context.Context, peerID string, content []byte, op uint32) (bool, error)
 	// Return the state of the node process
 	Status() status.Status
-	// Return this node's metalgo binary path
+	// Return this node's avalanchego binary path
 	GetBinaryPath() string
 	// Return this node's data dir
 	GetDataDir() string
@@ -59,7 +60,7 @@ type Node interface {
 	GetPaused() bool
 }
 
-// Config encapsulates an metalgo configuration
+// Config encapsulates an avalanchego configuration
 type Config struct {
 	// A node's name must be unique from all other nodes
 	// in a network. If Name is the empty string, a
@@ -99,14 +100,7 @@ type Config struct {
 
 // Validate returns an error if this config is invalid
 func (c *Config) Validate(expectedNetworkID uint32) error {
-	switch {
-	case c.StakingKey == "":
-		return errors.New("staking key not given")
-	case c.StakingCert == "":
-		return errors.New("staking cert not given")
-	default:
-		return validateConfigFile([]byte(c.ConfigFile), expectedNetworkID)
-	}
+	return validateConfigFile([]byte(c.ConfigFile), expectedNetworkID)
 }
 
 // Returns an error if config file [configFile] is invalid.

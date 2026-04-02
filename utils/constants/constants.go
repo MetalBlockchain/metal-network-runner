@@ -2,16 +2,15 @@
 // See the file LICENSE for licensing terms.
 package constants
 
-import "path/filepath"
-
 const (
-	LogNameMain    = "main"
-	LogNameControl = "control"
-	LogNameTest    = "test"
-	RootDirPrefix  = "network-runner-root-data"
-)
-
-var (
-	LocalConfigDir   = filepath.Join("local", "default")
-	LocalGenesisFile = "genesis.json"
+	LogNameMain            = "main"
+	LogNameControl         = "control"
+	LogNameTest            = "test"
+	RootDirPrefix          = "network-runner-root-data"
+	DefaultExecPathEnvVar  = "METALGO_EXEC_PATH"
+	DefaultPluginDirEnvVar = "METALGO_PLUGIN_PATH"
+	IPv4Lookback           = "127.0.0.1"
+	DefaultNetworkID       = 1337
+	DefaultNumNodes        = 5
+	FirstAPIPort           = 9650
 )
