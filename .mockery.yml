@@ -7,11 +7,13 @@ packages:
           dir: api/mocks
           filename: client.go
           structname: Client
+          pkgname: mocks
       EthClient:
         config:
           dir: api/mocks
           filename: EthClient.go
           structname: EthClient
+          pkgname: mocks
 
   github.com/MetalBlockchain/metal-network-runner/local:
     interfaces:
@@ -20,3 +22,4 @@ packages:
           dir: local/mocks
           filename: node_process.go
           structname: NodeProcess
+          pkgname: mocks
